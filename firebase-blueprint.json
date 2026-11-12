@@ -1,0 +1,196 @@
+{
+  "entities": {
+    "Administrator": {
+      "title": "Administrator",
+      "description": "Authorized admin users who have access to manage schedules, employees, and payroll.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 128 },
+        "role": { "type": "string", "enum": ["super_admin", "admin", "manager"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "createdBy": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["uid", "email", "role", "createdAt"]
+    },
+    "Employee": {
+      "title": "Employee",
+      "description": "Store employee profile, wage details, and employment status.",
+      "type": "object",
+      "properties": {
+        "employeeId": { "type": "string", "maxLength": 32 },
+        "fullName": { "type": "string", "maxLength": 100 },
+        "position": { "type": "string", "maxLength": 50 },
+        "department": { "type": "string", "maxLength": 50 },
+        "active": { "type": "boolean" },
+        "hourlyWage": { "type": "number" },
+        "hireDate": { "type": "string", "maxLength": 20 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "email": { "type": "string", "maxLength": 100 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "businessGroup": { "type": "string", "enum": ["CMORE DRUG STORE", "CULMORE SUPERMARKET", "TACOSSAM(FALLS CHURCH)", "TACOSSAM(ANANDALE)", "SSAM KITCHEN"] },
+        "groupNumber": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["employeeId", "fullName", "position", "active", "hourlyWage", "hireDate"]
+    },
+    "WeeklySchedule": {
+      "title": "WeeklySchedule",
+      "description": "Weekly schedule metadata for a Friday-through-Thursday workweek.",
+      "type": "object",
+      "properties": {
+        "weekStartDate": { "type": "string", "maxLength": 20 },
+        "weekEndDate": { "type": "string", "maxLength": 20 },
+        "status": { "type": "string", "enum": ["draft", "published", "archived"] },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["weekStartDate", "weekEndDate", "status"]
+    },
+    "Shift": {
+      "title": "Shift",
+      "description": "A scheduled shift for an employee on a specific day.",
+      "type": "object",
+      "properties": {
+        "shiftId": { "type": "string", "maxLength": 64 },
+        "scheduleId": { "type": "string", "maxLength": 64 },
+        "employeeId": { "type": "string", "maxLength": 32 },
+        "employeeName": { "type": "string", "maxLength": 100 },
+        "date": { "type": "string", "maxLength": 20 },
+        "dayOfWeek": { "type": "string", "maxLength": 20 },
+        "startTime": { "type": "string", "maxLength": 10 },
+        "endTime": { "type": "string", "maxLength": 10 },
+        "breakMinutes": { "type": "number" },
+        "hours": { "type": "number" },
+        "isOvernight": { "type": "boolean" },
+        "notes": { "type": "string", "maxLength": 200 }
+      },
+      "required": ["scheduleId", "employeeId", "date", "startTime", "endTime", "hours"]
+    },
+    "PayrollPeriod": {
+      "title": "PayrollPeriod",
+      "description": "Payroll period corresponding to a workweek with status, hours, and totals.",
+      "type": "object",
+      "properties": {
+        "periodId": { "type": "string", "maxLength": 64 },
+        "weekStartDate": { "type": "string", "maxLength": 20 },
+        "weekEndDate": { "type": "string", "maxLength": 20 },
+        "status": { "type": "string", "enum": ["draft", "pending_review", "finalized"] },
+        "totalRegularHours": { "type": "number" },
+        "totalOvertimeHours": { "type": "number" },
+        "totalGrossPay": { "type": "number" },
+        "totalTaxes": { "type": "number" },
+        "totalDeductions": { "type": "number" },
+        "totalNetPay": { "type": "number" },
+        "finalizedAt": { "type": "string", "format": "date-time" },
+        "finalizedBy": { "type": "string", "maxLength": 128 },
+        "reopenedAt": { "type": "string", "format": "date-time" },
+        "reopenedBy": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["periodId", "weekStartDate", "weekEndDate", "status"]
+    },
+    "PayrollRecord": {
+      "title": "PayrollRecord",
+      "description": "Individual employee payroll record for a specific pay period.",
+      "type": "object",
+      "properties": {
+        "recordId": { "type": "string", "maxLength": 64 },
+        "periodId": { "type": "string", "maxLength": 64 },
+        "employeeId": { "type": "string", "maxLength": 32 },
+        "employeeName": { "type": "string", "maxLength": 100 },
+        "position": { "type": "string", "maxLength": 50 },
+        "hourlyWage": { "type": "number" },
+        "regularHours": { "type": "number" },
+        "overtimeHours": { "type": "number" },
+        "regularPay": { "type": "number" },
+        "overtimePay": { "type": "number" },
+        "grossPay": { "type": "number" },
+        "federalWithholding": { "type": "number" },
+        "vaWithholding": { "type": "number" },
+        "socialSecurityTax": { "type": "number" },
+        "medicareTax": { "type": "number" },
+        "insuranceDeduction": { "type": "number" },
+        "otherDeductions": { "type": "number" },
+        "totalDeductions": { "type": "number" },
+        "netPay": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 500 }
+      },
+      "required": ["periodId", "employeeId", "hourlyWage", "regularHours", "overtimeHours", "grossPay", "netPay"]
+    },
+    "StoreSettings": {
+      "title": "StoreSettings",
+      "description": "Global store and payroll configuration for tax rates, overtime rules, and business details.",
+      "type": "object",
+      "properties": {
+        "storeName": { "type": "string", "maxLength": 100 },
+        "storeNameKo": { "type": "string", "maxLength": 100 },
+        "address": { "type": "string", "maxLength": 200 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "federalTaxDefaultRate": { "type": "number" },
+        "vaTaxDefaultRate": { "type": "number" },
+        "socialSecurityRate": { "type": "number" },
+        "medicareRate": { "type": "number" },
+        "overtimeMultiplier": { "type": "number" },
+        "defaultBreakMinutes": { "type": "number" },
+        "workWeekStartDay": { "type": "string", "maxLength": 20 },
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "updatedBy": { "type": "string", "maxLength": 128 }
+      },
+      "required": ["storeName", "socialSecurityRate", "medicareRate", "overtimeMultiplier"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Audit trail log entry for payroll modifications, unlocks, and critical admin actions.",
+      "type": "object",
+      "properties": {
+        "action": { "type": "string", "maxLength": 100 },
+        "entity": { "type": "string", "maxLength": 50 },
+        "entityId": { "type": "string", "maxLength": 64 },
+        "details": { "type": "string", "maxLength": 500 },
+        "performedBy": { "type": "string", "maxLength": 128 },
+        "performedByEmail": { "type": "string", "maxLength": 128 },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["action", "entity", "performedByEmail", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/administrators/{adminId}": {
+      "schema": { "$ref": "#/entities/Administrator" },
+      "description": "Authorized administrators."
+    },
+    "/employees/{employeeDocId}": {
+      "schema": { "$ref": "#/entities/Employee" },
+      "description": "Employee records and wage details."
+    },
+    "/schedules/{scheduleId}": {
+      "schema": { "$ref": "#/entities/WeeklySchedule" },
+      "description": "Weekly schedule periods."
+    },
+    "/schedules/{scheduleId}/shifts/{shiftId}": {
+      "schema": { "$ref": "#/entities/Shift" },
+      "description": "Daily shifts within a schedule week."
+    },
+    "/payrollPeriods/{periodId}": {
+      "schema": { "$ref": "#/entities/PayrollPeriod" },
+      "description": "Weekly payroll periods and state."
+    },
+    "/payrollRecords/{recordId}": {
+      "schema": { "$ref": "#/entities/PayrollRecord" },
+      "description": "Individual pay records per employee per period."
+    },
+    "/settings/{settingId}": {
+      "schema": { "$ref": "#/entities/StoreSettings" },
+      "description": "Store configuration and tax settings."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Audit trail for compliance and tracking."
+    }
+  }
+}

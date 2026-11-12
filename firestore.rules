@@ -1,0 +1,96 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default-deny catch-all (Pillar 1 of security rules)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Common security helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // Runtime initial admin email from environment / setup
+    function isSuperUser() {
+      return isSignedIn() && (
+        request.auth.token.email == 'jaraman1215@gmail.com'
+      );
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        isSuperUser() ||
+        exists(/databases/$(database)/documents/administrators/$(request.auth.uid))
+      );
+    }
+
+    // Administrators collection
+    match /administrators/{adminId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn() && isValidId(adminId) && (isSuperUser() || isAdmin()) &&
+        request.resource.data.email is string &&
+        request.resource.data.role in ['super_admin', 'admin', 'manager'];
+      allow update: if isAdmin() && isValidId(adminId);
+      allow delete: if isSuperUser() && isValidId(adminId) && adminId != request.auth.uid;
+    }
+
+    // Employees collection
+    match /employees/{employeeId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && isValidId(employeeId) &&
+        request.resource.data.employeeId is string &&
+        request.resource.data.fullName is string &&
+        request.resource.data.position is string &&
+        request.resource.data.hourlyWage is number &&
+        request.resource.data.active is bool;
+      allow update: if isAdmin() && isValidId(employeeId);
+      allow delete: if isAdmin() && isValidId(employeeId);
+    }
+
+    // Weekly schedules
+    match /schedules/{scheduleId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && isValidId(scheduleId);
+
+      // Subcollection shifts
+      match /shifts/{shiftId} {
+        allow read: if isAdmin();
+        allow create, update, delete: if isAdmin() && isValidId(shiftId);
+      }
+    }
+
+    // Payroll Periods
+    match /payrollPeriods/{periodId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && isValidId(periodId);
+    }
+
+    // Individual Payroll Records
+    match /payrollRecords/{recordId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && isValidId(recordId);
+    }
+
+    // Global Store Settings
+    match /settings/{settingId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && isValidId(settingId);
+      allow delete: if false;
+    }
+
+    // Audit logs (immutable once created, append-only by admins)
+    match /auditLogs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && isValidId(logId) &&
+        request.resource.data.action is string &&
+        request.resource.data.performedByEmail is string;
+      allow update, delete: if false;
+    }
+  }
+}

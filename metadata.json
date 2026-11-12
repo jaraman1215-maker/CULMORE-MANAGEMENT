@@ -1,0 +1,6 @@
+{
+  "name": "Hanaro Market - Employee Scheduling & Payroll Management",
+  "description": "Bilingual (English & Korean) admin dashboard for employee management, weekly Friday-Thursday scheduling with overnight shift support, and compliant Virginia payroll calculation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

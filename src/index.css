@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Inter', 'Noto Sans KR', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+}
+
+@page {
+  size: landscape;
+  margin: 8mm 6mm;
+}
+
+@media print {
+  html, body {
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+    font-size: 9pt !important;
+    width: 100% !important;
+    min-width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  .no-print,
+  aside,
+  header,
+  nav {
+    display: none !important;
+  }
+
+  .print-only {
+    display: block !important;
+  }
+
+  .page-break {
+    page-break-after: always;
+  }
+
+  .shadow-xs, .shadow-sm, .shadow-md, .shadow-lg, .shadow-xl {
+    box-shadow: none !important;
+  }
+
+  .border-slate-200, .border-slate-300 {
+    border-color: #cbd5e1 !important;
+  }
+
+  /* Full width layout reset */
+  main,
+  div[class*="lg:pl-72"],
+  div[class*="max-w-"] {
+    max-width: 100% !important;
+    width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /* Table print resets */
+  table {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    page-break-inside: auto !important;
+  }
+
+  tr {
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+
+  th, td {
+    position: static !important;
+    white-space: normal !important;
+    word-break: break-word !important;
+  }
+
+  .overflow-x-auto,
+  div[class*="overflow-"] {
+    overflow: visible !important;
+  }
+}
+
+@media screen {
+  .print-only {
+    display: none !important;
+  }
+}
+

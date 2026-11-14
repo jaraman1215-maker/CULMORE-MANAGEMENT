@@ -128,11 +128,11 @@ export const PrintPaystubStandaloneView: React.FC<PrintPaystubStandaloneViewProp
         <div className="p-12 text-center text-slate-500 font-medium">
           {language === 'ko' ? '급여명세서 데이터를 불러오는 중입니다...' : 'Loading paystub document...'}
         </div>
-      ) : !record ? (
+      ) : !record || !employee || !employee.active ? (
         <div className="p-12 text-center text-rose-500 font-bold bg-rose-50 rounded-2xl border border-rose-200 max-w-lg mx-auto">
           {language === 'ko'
-            ? '해당 직원의 급여명세서 기록을 찾을 수 없습니다.'
-            : 'Paystub record not found for this employee and date.'}
+            ? '등록된 재직 직원의 급여명세서 기록을 찾을 수 없습니다.'
+            : 'Active employee paystub record not found for this employee and date.'}
         </div>
       ) : (
         /* Printable Official Paystub Document */

@@ -20,6 +20,8 @@ import {
   UserCheck,
   UserX,
   Store,
+  Trash2,
+  KeyRound,
 } from 'lucide-react';
 import {
   Employee,
@@ -31,12 +33,16 @@ import {
 } from '../types';
 import { useLanguage } from '../context/LanguageContext';
 import { formatCurrency } from '../utils/calculations';
+import { PasswordResetInitialTarget } from './PasswordResetModal';
 
 interface EmployeesViewProps {
   employees: Employee[];
   onSaveEmployee: (employee: Employee) => Promise<void>;
   onArchiveEmployee: (employeeId: string, active: boolean) => Promise<void>;
+  onDeleteEmployee?: (employeeId: string) => Promise<void>;
+  onDeleteAllEmployees?: () => Promise<void>;
   onSeedSampleData: () => Promise<void>;
+  onOpenPasswordReset?: (target?: PasswordResetInitialTarget) => void;
 }
 
 const DEPARTMENTS: GroceryDepartment[] = [
@@ -56,7 +62,10 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
   employees,
   onSaveEmployee,
   onArchiveEmployee,
+  onDeleteEmployee,
+  onDeleteAllEmployees,
   onSeedSampleData,
+  onOpenPasswordReset,
 }) => {
   const { t, language } = useLanguage();
 
@@ -70,12 +79,38 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
   const [confirmArchiveEmp, setConfirmArchiveEmp] = useState<Employee | null>(null);
+  const [confirmDeleteEmp, setConfirmDeleteEmp] = useState<Employee | null>(null);
+  const [isDeleteAllModalOpen, setIsDeleteAllModalOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  const handleDeleteSingle = async () => {
+    if (!confirmDeleteEmp || !onDeleteEmployee) return;
+    try {
+      setIsDeleting(true);
+      await onDeleteEmployee(confirmDeleteEmp.id || confirmDeleteEmp.employeeId);
+      setConfirmDeleteEmp(null);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const handleDeleteAll = async () => {
+    if (!onDeleteAllEmployees) return;
+    try {
+      setIsDeleting(true);
+      await onDeleteAllEmployees();
+      setIsDeleteAllModalOpen(false);
+    } finally {
+      setIsDeleting(false);
+    }
+  };
 
   // Form states
   const [formData, setFormData] = useState<Partial<Employee>>({
     employeeId: '',
     fullName: '',
     fullNameKo: '',
+    nickname: '',
     position: '',
     department: 'Cashiers & Front End',
     businessGroup: 'CULMORE SUPERMARKET',
@@ -106,6 +141,7 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
       employeeId: `EMP-${nextIdNum}`,
       fullName: '',
       fullNameKo: '',
+      nickname: '',
       position: '',
       department: defaultGrp.groupNumber === 1 ? 'Pharmacy & Health' : (defaultGrp.groupNumber >= 3 ? 'Kitchen & Cooking' : 'Cashiers & Front End'),
       businessGroup: defaultGrp.name,
@@ -175,6 +211,7 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
         employeeId: formData.employeeId.trim().toUpperCase(),
         fullName: formData.fullName.trim(),
         fullNameKo: formData.fullNameKo?.trim() || '',
+        nickname: formData.nickname?.trim() || '',
         position: formData.position.trim(),
         department: (formData.department as GroceryDepartment) || 'Grocery & Stocking',
         businessGroup: resolvedGrp.name,
@@ -219,6 +256,7 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
     const matchesSearch =
       emp.fullName.toLowerCase().includes(term) ||
       (emp.fullNameKo && emp.fullNameKo.toLowerCase().includes(term)) ||
+      (emp.nickname && emp.nickname.toLowerCase().includes(term)) ||
       emp.employeeId.toLowerCase().includes(term) ||
       emp.position.toLowerCase().includes(term);
 
@@ -251,6 +289,17 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
         </div>
 
         <div className="flex items-center space-x-2">
+          {employees.length > 0 && onDeleteAllEmployees && (
+            <button
+              onClick={() => setIsDeleteAllModalOpen(true)}
+              className="px-3.5 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-bold shadow-xs transition-colors flex items-center space-x-1.5 cursor-pointer"
+              title={language === 'ko' ? '모든 직원을 전체 삭제합니다' : 'Delete all employees and reset roster'}
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>{language === 'ko' ? '모든 직원 삭제' : 'Delete All Staff'}</span>
+            </button>
+          )}
+
           {employees.length === 0 && (
             <button
               onClick={onSeedSampleData}
@@ -357,7 +406,7 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
                     {language === 'ko' ? '재직 직원' : 'Active Staff'}
                   </span>
                   <span className="font-mono font-black text-slate-900 text-sm">
-                    {activeEmps.length} <span className="text-xs font-normal text-slate-500">/ {grpEmps.length}명</span>
+                    {activeEmps.length} <span className="text-xs font-normal text-slate-500">/ {grpEmps.length}{language === 'ko' ? '명' : ' staff'}</span>
                   </span>
                 </div>
 
@@ -492,7 +541,14 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
                   </td>
                   <td className="py-3 px-4">
                     <div>
-                      <p className="font-bold text-slate-900">{emp.fullName}</p>
+                      <div className="flex items-center space-x-1.5 flex-wrap">
+                        <p className="font-bold text-slate-900">{emp.fullName}</p>
+                        {emp.nickname && (
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-bold">
+                            {emp.nickname}
+                          </span>
+                        )}
+                      </div>
                       {emp.fullNameKo && (
                         <p className="text-[11px] text-slate-500 font-medium">{emp.fullNameKo}</p>
                       )}
@@ -535,6 +591,22 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
                   </td>
                   <td className="py-3 px-4 text-right">
                     <div className="flex items-center justify-end space-x-1.5">
+                      {onOpenPasswordReset && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onOpenPasswordReset({
+                              type: 'employee',
+                              idOrEmail: emp.employeeId,
+                            })
+                          }
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-amber-600 hover:bg-amber-50 transition-colors cursor-pointer"
+                          title={language === 'ko' ? '임시 인증 코드로 비밀번호 재설정' : 'Reset Password via Temp Code'}
+                        >
+                          <KeyRound className="w-4 h-4" />
+                        </button>
+                      )}
+
                       <button
                         onClick={() => openEditModal(emp)}
                         className="p-1.5 rounded-lg text-slate-500 hover:text-emerald-700 hover:bg-emerald-50 transition-colors cursor-pointer"
@@ -546,7 +618,7 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
                       {emp.active ? (
                         <button
                           onClick={() => setConfirmArchiveEmp(emp)}
-                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-amber-600 hover:bg-amber-50 transition-colors cursor-pointer"
                           title={t('archiveEmployee')}
                         >
                           <Archive className="w-4 h-4" />
@@ -559,6 +631,16 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
                         >
                           <RotateCcw className="w-3.5 h-3.5" />
                           <span>{language === 'ko' ? '재직 복귀' : 'Reactivate'}</span>
+                        </button>
+                      )}
+
+                      {onDeleteEmployee && (
+                        <button
+                          onClick={() => setConfirmDeleteEmp(emp)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+                          title={language === 'ko' ? '직원 영구 삭제' : 'Permanently Delete Employee'}
+                        >
+                          <Trash2 className="w-4 h-4" />
                         </button>
                       )}
                     </div>
@@ -640,7 +722,7 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div>
                   <label className="font-bold text-slate-700 block mb-1">
                     {t('fullName')} *
@@ -657,13 +739,26 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
 
                 <div>
                   <label className="font-bold text-slate-700 block mb-1">
+                    {t('nicknameLabel')}
+                  </label>
+                  <input
+                    type="text"
+                    value={formData.nickname || ''}
+                    onChange={(e) => setFormData({ ...formData, nickname: e.target.value })}
+                    placeholder={t('nicknamePlaceholder')}
+                    className="w-full px-3 py-2 rounded-xl border border-emerald-200 bg-emerald-50/40 text-slate-900 font-bold focus:bg-white focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="font-bold text-slate-700 block mb-1">
                     {t('fullNameKo')}
                   </label>
                   <input
                     type="text"
                     value={formData.fullNameKo}
                     onChange={(e) => setFormData({ ...formData, fullNameKo: e.target.value })}
-                    placeholder="예: 김민준"
+                    placeholder={language === 'ko' ? '예: 김민준' : 'e.g. Min-Jun Kim'}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-slate-900 font-semibold focus:bg-white focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
                   />
                 </div>
@@ -931,10 +1026,92 @@ export const EmployeesView: React.FC<EmployeesViewProps> = ({
               <button
                 onClick={() => handleToggleArchive(confirmArchiveEmp)}
                 className={`px-4 py-2 rounded-xl text-white text-xs font-bold shadow-xs ${
-                  confirmArchiveEmp.active ? 'bg-rose-600 hover:bg-rose-700' : 'bg-emerald-600 hover:bg-emerald-700'
+                  confirmArchiveEmp.active ? 'bg-amber-600 hover:bg-amber-700' : 'bg-emerald-600 hover:bg-emerald-700'
                 }`}
               >
                 {confirmArchiveEmp.active ? t('archiveEmployee') : t('reactivateEmployee')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation modal for single employee permanent deletion */}
+      {confirmDeleteEmp && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl shadow-xl max-w-md w-full p-6 border border-slate-200 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center space-x-3 text-rose-600 mb-3">
+              <Trash2 className="w-6 h-6" />
+              <h3 className="text-base font-bold text-slate-900">
+                {language === 'ko' ? '직원 영구 삭제' : 'Permanently Delete Employee'}
+              </h3>
+            </div>
+            <p className="text-xs text-slate-600 leading-relaxed mb-4">
+              {language === 'ko'
+                ? '이 직원을 영구 삭제하시겠습니까? 등록된 모든 근무 스케줄, 미확정 급여 내역 및 명세서에서 즉시 삭제됩니다.'
+                : 'Are you sure you want to permanently delete this employee? Their shifts and active payroll records will be permanently removed.'}
+            </p>
+            <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs font-medium text-slate-700 mb-5">
+              <p className="font-bold text-rose-900">{confirmDeleteEmp.fullName} ({confirmDeleteEmp.employeeId})</p>
+              <p className="text-rose-700">{confirmDeleteEmp.position} • {confirmDeleteEmp.department}</p>
+            </div>
+            <div className="flex justify-end space-x-2">
+              <button
+                disabled={isDeleting}
+                onClick={() => setConfirmDeleteEmp(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold cursor-pointer"
+              >
+                {t('cancel')}
+              </button>
+              <button
+                disabled={isDeleting}
+                onClick={handleDeleteSingle}
+                className="px-4 py-2 rounded-xl text-white text-xs font-bold shadow-xs bg-rose-600 hover:bg-rose-700 cursor-pointer"
+              >
+                {isDeleting ? (language === 'ko' ? '삭제 중...' : 'Deleting...') : (language === 'ko' ? '영구 삭제' : 'Delete Permanently')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmation modal for DELETE ALL EMPLOYEES */}
+      {isDeleteAllModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl shadow-xl max-w-md w-full p-6 border border-slate-200 animate-in fade-in zoom-in-95 duration-150">
+            <div className="flex items-center space-x-3 text-rose-600 mb-3">
+              <Trash2 className="w-6 h-6" />
+              <h3 className="text-base font-bold text-slate-900">
+                {language === 'ko' ? '모든 직원 전체 삭제' : 'Delete All Employees'}
+              </h3>
+            </div>
+            <p className="text-xs text-slate-600 leading-relaxed mb-4">
+              {language === 'ko'
+                ? '정말 모든 직원을 전체 삭제하시겠습니까? 등록된 모든 근무 스케줄 및 급여 데이터도 함께 초기화되며, 완전히 깨끗한 상태에서 시작할 수 있습니다.'
+                : 'Are you sure you want to delete ALL employees? All scheduled shifts and payroll records will also be wiped clean, allowing you to start fresh.'}
+            </p>
+            <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900 mb-5">
+              <p className="font-bold">⚠️ {language === 'ko' ? '주의: 되돌릴 수 없는 작업입니다' : 'Warning: This cannot be undone'}</p>
+              <p className="text-[11px] mt-0.5 opacity-90">
+                {language === 'ko'
+                  ? `현재 등록된 ${employees.length}명의 모든 직원 데이터가 완전히 삭제됩니다.`
+                  : `All ${employees.length} current employees will be completely erased.`}
+              </p>
+            </div>
+            <div className="flex justify-end space-x-2">
+              <button
+                disabled={isDeleting}
+                onClick={() => setIsDeleteAllModalOpen(false)}
+                className="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold cursor-pointer"
+              >
+                {t('cancel')}
+              </button>
+              <button
+                disabled={isDeleting}
+                onClick={handleDeleteAll}
+                className="px-4 py-2 rounded-xl text-white text-xs font-bold shadow-xs bg-rose-600 hover:bg-rose-700 cursor-pointer"
+              >
+                {isDeleting ? (language === 'ko' ? '초기화 중...' : 'Wiping...') : (language === 'ko' ? '모든 직원 삭제 실행' : 'Confirm Delete All')}
               </button>
             </div>
           </div>

@@ -29,8 +29,20 @@ import {
   ExternalLink,
   Info,
   Edit3,
+  HardDriveDownload,
+  FolderOpen,
+  Upload,
+  Archive,
 } from 'lucide-react';
-import { Employee, PayrollRecord, PayrollPeriod, StoreSettings, BUSINESS_GROUPS, getBusinessGroup } from '../types';
+import {
+  Employee,
+  PayrollRecord,
+  PayrollPeriod,
+  StoreSettings,
+  BUSINESS_GROUPS,
+  getBusinessGroup,
+  FinalPayrollArchive,
+} from '../types';
 import { useLanguage } from '../context/LanguageContext';
 import { useAuth } from '../context/AuthContext';
 import { useExchangeRate } from '../context/ExchangeRateContext';
@@ -48,6 +60,14 @@ import {
   fetchPayrollRecords,
   PaymentAndTaxUpdates,
 } from '../firebase/dataService';
+import {
+  buildFinalPayrollArchive,
+  saveFinalPayrollArchiveLocal,
+  loadFinalPayrollArchivesLocal,
+  downloadFinalPayrollArchiveToComputer,
+  parseFinalPayrollArchiveJson,
+  openHtmlInNewTabForPrint,
+} from '../utils/backupUtils';
 
 interface ReportsViewProps {
   employees: Employee[];
@@ -74,13 +94,22 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const { usdToKrwRate, formatKrw } = useExchangeRate();
   const { isDemoMode } = useAuth();
 
-  const [activeReportTab, setActiveReportTab] = useState<'paystub' | 'summary' | 'historical'>('paystub');
+  const [activeReportTab, setActiveReportTab] = useState<'paystub' | 'summary' | 'historical' | 'archived'>('paystub');
   const [selectedGroup, setSelectedGroup] = useState<string>('ALL');
   const [paystubSearchTerm, setPaystubSearchTerm] = useState<string>('');
   const [selectedEmployeeId, setSelectedEmployeeId] = useState<string>(
     payrollRecords[0]?.employeeId || employees[0]?.employeeId || ''
   );
   const [searchFilter, setSearchFilter] = useState('');
+
+  // Final Archive State (Auto-saved + Loaded from Computer)
+  const [savedFinalArchives, setSavedFinalArchives] = useState<FinalPayrollArchive[]>(() =>
+    loadFinalPayrollArchivesLocal()
+  );
+  const [loadedArchive, setLoadedArchive] = useState<FinalPayrollArchive | null>(null);
+  const [archiveSubView, setArchiveSubView] = useState<'register' | 'paystub'>('register');
+  const [archiveEmpId, setArchiveEmpId] = useState<string>('');
+  const [archiveFeedback, setArchiveFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // Historical Payroll State (Select pay date to view & print)
   const [selectedHistoricalFriday, setSelectedHistoricalFriday] = useState<string>(currentWeekFriday);
@@ -100,6 +129,80 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const [printModalTargetWeek, setPrintModalTargetWeek] = useState<string>(currentWeekFriday);
   const [printModalTargetGroup, setPrintModalTargetGroup] = useState<string>(selectedGroup || 'ALL');
   const [printFeedback, setPrintFeedback] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSavedFinalArchives(loadFinalPayrollArchivesLocal());
+  }, [payrollPeriod]);
+
+  const handleSaveCurrentFinalToComputer = () => {
+    const activeIds = new Set(employees.filter((e) => e.active).map((e) => e.employeeId));
+    const working = payrollRecords.filter(
+      (r) =>
+        activeIds.has(r.employeeId) &&
+        (r.regularHours > 0 || r.overtimeHours > 0 || r.grossPay > 0 || (r.adjustments && r.adjustments.length > 0))
+    );
+    const periodObj: PayrollPeriod = payrollPeriod || {
+      id: `period_${currentWeekFriday}`,
+      weekStartDate: currentWeekFriday,
+      weekEndDate: getWorkWeekThursday(currentWeekFriday),
+      status: 'draft',
+      totalRegularHours: working.reduce((s, r) => s + r.regularHours, 0),
+      totalOvertimeHours: working.reduce((s, r) => s + r.overtimeHours, 0),
+      totalGrossPay: working.reduce((s, r) => s + r.grossPay, 0),
+      totalTaxes: working.reduce((s, r) => s + r.totalTaxes, 0),
+      totalDeductions: working.reduce((s, r) => s + r.totalDeductions, 0),
+      totalNetPay: working.reduce((s, r) => s + r.netPay, 0),
+    };
+    const archive = buildFinalPayrollArchive({
+      period: periodObj,
+      records: working,
+      employees: employees.filter((e) => e.active),
+      settings,
+      finalizedBy: periodObj.finalizedBy || 'admin',
+    });
+    const updatedList = saveFinalPayrollArchiveLocal(archive);
+    setSavedFinalArchives(updatedList);
+    const filename = downloadFinalPayrollArchiveToComputer(archive);
+    setArchiveFeedback({
+      type: 'success',
+      text:
+        language === 'ko'
+          ? `최종 급여명세서 및 보고서 파일(${filename})이 컴퓨터에 저장되었습니다.`
+          : `Final report & paystub archive (${filename}) saved to your computer.`,
+    });
+  };
+
+  const handleUploadArchiveFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = parseFinalPayrollArchiveJson(text);
+      setLoadedArchive(parsed);
+      setArchiveEmpId(parsed.records[0]?.employeeId || '');
+      setArchiveSubView('register');
+      setActiveReportTab('archived');
+      setArchiveFeedback({
+        type: 'success',
+        text:
+          language === 'ko'
+            ? `저장된 최종본 파일(${parsed.period.weekStartDate})을 성공적으로 불러왔습니다.`
+            : `Loaded saved final archive for pay date ${parsed.period.weekStartDate}.`,
+      });
+    } catch (err) {
+      setArchiveFeedback({
+        type: 'error',
+        text:
+          language === 'ko'
+            ? '올바른 급여 최종본 파일(.json)이 아닙니다.'
+            : err instanceof Error
+            ? err.message
+            : 'Invalid final payroll archive file.',
+      });
+    } finally {
+      e.target.value = '';
+    }
+  };
 
   // Paystub Direct Tax Input / Override State (Item 4)
   const [isPaystubTaxModalOpen, setIsPaystubTaxModalOpen] = useState(false);
@@ -252,14 +355,17 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     return getBusinessGroup(rec?.businessGroup || rec?.groupNumber || emp?.businessGroup || emp?.groupNumber);
   };
 
-  // Filter payroll records that actually have worked hours or pay/adjustments (Item: exclude non-applicable employees)
-  const activeWorkingRecords = payrollRecords.filter(
-    (r) =>
+  // Filter payroll records that actually have worked hours or pay/adjustments (strictly exclude deleted & unactive employees)
+  const activeWorkingRecords = payrollRecords.filter((r) => {
+    const emp = employees.find((e) => e.employeeId === r.employeeId);
+    if (!emp || emp.active === false) return false;
+    return (
       r.regularHours > 0 ||
       r.overtimeHours > 0 ||
       r.grossPay > 0 ||
       (r.adjustments && r.adjustments.length > 0)
-  );
+    );
+  });
 
   // Group metrics: only count working employees who actually have payroll in this period
   const groupMetrics = BUSINESS_GROUPS.map((grp) => {
@@ -427,8 +533,19 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     }
   };
 
-  // Download standalone printable HTML for Paystub
-  const handleDownloadPaystubHtml = (rec: PayrollRecord, emp?: Employee, weekYmd?: string) => {
+  // Download or open printable HTML for Paystub
+  const handleDownloadPaystubHtml = (
+    rec: PayrollRecord,
+    emp?: Employee,
+    weekYmd?: string,
+    openInNewTab: boolean = false,
+    customSettings?: StoreSettings
+  ) => {
+    const activeSettings = customSettings || settings;
+    const activeStoreName =
+      activeSettings.storeName && !activeSettings.storeName.includes('Hanaro') && !activeSettings.storeName.includes('CMORE')
+        ? activeSettings.storeName
+        : 'MANAGEMENT OF CULMORE';
     const targetWeek = weekYmd || currentWeekFriday;
     const grp = getBusinessGroup(rec.businessGroup || rec.groupNumber || emp?.businessGroup || emp?.groupNumber);
     const filename = `Culmore_Paystub_${rec.employeeName.replace(/\\s+/g, '_')}_${rec.employeeId}_${targetWeek}.html`;
@@ -467,20 +584,20 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 </head>
 <body>
   <div class="no-print" style="background: #0f172a; color: white; padding: 10px 16px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center;">
-    <strong>MANAGEMENT OF CULMORE — 공식 급여명세서 인쇄본</strong>
-    <button onclick="window.print()" style="background: #10b981; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-weight: bold; cursor: pointer;">지금 바로 인쇄 (Print)</button>
+    <strong>MANAGEMENT OF CULMORE — ${language === 'ko' ? '공식 급여명세서 인쇄본' : 'Official Paystub Record'}</strong>
+    <button onclick="window.print()" style="background: #10b981; color: white; border: none; padding: 6px 14px; border-radius: 6px; font-weight: bold; cursor: pointer;">${language === 'ko' ? '지금 바로 인쇄 (Print)' : 'Print Now'}</button>
   </div>
 
   <div class="header">
     <div>
-      <h1 class="company">${grp ? grp.name : displayStoreName}</h1>
-      <p class="meta">${displayStoreName} • ${settings.address}, ${settings.city}, ${settings.state} ${settings.zipCode}</p>
-      <p class="meta">Phone: ${settings.phone} • Employer EIN: ${settings.ein}</p>
+      <h1 class="company">${grp ? grp.name : activeStoreName}</h1>
+      <p class="meta">${activeStoreName} • ${activeSettings.address}, ${activeSettings.city}, ${activeSettings.state} ${activeSettings.zipCode}</p>
+      <p class="meta">Phone: ${activeSettings.phone} • Employer EIN: ${activeSettings.ein}</p>
     </div>
     <div style="text-align: right;">
       <div class="title-badge">OFFICIAL PAYROLL STATEMENT</div>
-      <p class="meta" style="font-weight: bold; margin-top: 4px;">Pay Date: ${targetWeek} (Friday)</p>
-      <p class="meta">Period: ${formatWorkWeekRange(targetWeek, 'en')}</p>
+      <p class="meta" style="font-weight: bold; margin-top: 4px;">Pay Date: ${targetWeek} (${language === 'ko' ? '금요일' : 'Friday'})</p>
+      <p class="meta">Period: ${formatWorkWeekRange(targetWeek, language)}</p>
     </div>
   </div>
 
@@ -498,8 +615,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       <table>
         <thead><tr><th>Description</th><th class="text-right">Hours</th><th class="text-right">Rate</th><th class="text-right">Total</th></tr></thead>
         <tbody>
-          <tr><td>Regular Pay (기본)</td><td class="text-right">${rec.regularHours.toFixed(2)}h</td><td class="text-right">$${rec.hourlyWage.toFixed(2)}</td><td class="text-right font-bold">$${rec.regularPay.toFixed(2)}</td></tr>
-          <tr><td>Overtime Pay (1.5x)</td><td class="text-right">${rec.overtimeHours.toFixed(2)}h</td><td class="text-right">$${(rec.hourlyWage * 1.5).toFixed(2)}</td><td class="text-right font-bold">$${rec.overtimePay.toFixed(2)}</td></tr>
+          <tr><td>${language === 'ko' ? 'Regular Pay (기본)' : 'Regular Pay'}</td><td class="text-right">${rec.regularHours.toFixed(2)}h</td><td class="text-right">$${rec.hourlyWage.toFixed(2)}</td><td class="text-right font-bold">$${rec.regularPay.toFixed(2)}</td></tr>
+          <tr><td>${language === 'ko' ? 'Overtime Pay (1.5x 연장)' : 'Overtime Pay (1.5x)'}</td><td class="text-right">${rec.overtimeHours.toFixed(2)}h</td><td class="text-right">$${(rec.hourlyWage * 1.5).toFixed(2)}</td><td class="text-right font-bold">$${rec.overtimePay.toFixed(2)}</td></tr>
           <tr style="background: #f8fafc; font-weight: bold; border-top: 2px solid #cbd5e1;"><td>GROSS EARNINGS</td><td class="text-right">${(rec.regularHours + rec.overtimeHours).toFixed(2)}h</td><td></td><td class="text-right font-bold">$${rec.grossPay.toFixed(2)}</td></tr>
         </tbody>
       </table>
@@ -510,12 +627,12 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       <table>
         <thead><tr><th>Deduction Item</th><th class="text-right">Rate / Basis</th><th class="text-right">Withheld Amount</th></tr></thead>
         <tbody>
-          <tr><td>Federal Withholding (연방소득세)</td><td class="text-right">IRS Pub 15-T</td><td class="text-right" style="color: #b91c1c;">-$${rec.federalWithholding.toFixed(2)}</td></tr>
-          <tr><td>Virginia State Tax (VA 주소득세)</td><td class="text-right">VA 5.75% bracket</td><td class="text-right" style="color: #b91c1c;">-$${rec.vaWithholding.toFixed(2)}</td></tr>
-          <tr><td>Social Security Tax (사회보장세)</td><td class="text-right">6.20%</td><td class="text-right" style="color: #b91c1c;">-$${rec.socialSecurityTax.toFixed(2)}</td></tr>
-          <tr><td>Medicare Tax (메디케어)</td><td class="text-right">1.45%</td><td class="text-right" style="color: #b91c1c;">-$${rec.medicareTax.toFixed(2)}</td></tr>
+          <tr><td>${language === 'ko' ? 'Federal Withholding (연방소득세)' : 'Federal Withholding (FIT)'}</td><td class="text-right">IRS Pub 15-T</td><td class="text-right" style="color: #b91c1c;">-$${rec.federalWithholding.toFixed(2)}</td></tr>
+          <tr><td>${language === 'ko' ? 'Virginia State Tax (VA 주소득세)' : 'Virginia State Tax (SIT)'}</td><td class="text-right">VA 5.75% bracket</td><td class="text-right" style="color: #b91c1c;">-$${rec.vaWithholding.toFixed(2)}</td></tr>
+          <tr><td>${language === 'ko' ? 'Social Security Tax (사회보장세)' : 'Social Security Tax (FICA)'}</td><td class="text-right">6.20%</td><td class="text-right" style="color: #b91c1c;">-$${rec.socialSecurityTax.toFixed(2)}</td></tr>
+          <tr><td>${language === 'ko' ? 'Medicare Tax (메디케어)' : 'Medicare Tax (FICA)'}</td><td class="text-right">1.45%</td><td class="text-right" style="color: #b91c1c;">-$${rec.medicareTax.toFixed(2)}</td></tr>
           ${(rec.insuranceDeduction + rec.otherDeductions) > 0 ? `<tr><td>Insurance / Other Deductions</td><td class="text-right">Pre/Post tax</td><td class="text-right" style="color: #b91c1c;">-$${(rec.insuranceDeduction + rec.otherDeductions).toFixed(2)}</td></tr>` : ''}
-          <tr style="background: #f8fafc; font-weight: bold; border-top: 2px solid #cbd5e1;"><td>TOTAL TAXES & DEDUCTIONS</td><td></td><td class="text-right" style="color: #b91c1c; font-weight: bold;">-$${rec.totalTaxes.toFixed(2)}</td></tr>
+          <tr style="background: #f8fafc; font-weight: bold; border-top: 2px solid #cbd5e1;"><td>TOTAL TAXES & DEDUCTIONS</td><td></td><td class="text-right" style="color: #b91c1c; font-weight: bold;">-$${rec.totalDeductions.toFixed(2)}</td></tr>
         </tbody>
       </table>
     </div>
@@ -523,8 +640,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
   <div class="net-banner">
     <div>
-      <div class="net-title">NET PAY (실지급액) — Friday Disbursement</div>
-      <div style="font-size: 11px; color: #166534; margin-top: 2px;">Gross Pay ($${rec.grossPay.toFixed(2)}) - Total Deductions ($${rec.totalTaxes.toFixed(2)})</div>
+      <div class="net-title">${language === 'ko' ? 'NET PAY (실지급액) — Friday Disbursement' : 'NET PAY — Friday Disbursement'}</div>
+      <div style="font-size: 11px; color: #166534; margin-top: 2px;">Gross Pay ($${rec.grossPay.toFixed(2)}) - Total Deductions ($${rec.totalDeductions.toFixed(2)})${rec.paymentMethod ? ` • Payment: ${rec.paymentMethod} (Check: $${(rec.checkAmount ?? rec.netPay).toFixed(2)} / Cash: $${(rec.cashAmount ?? 0).toFixed(2)})` : ''}</div>
     </div>
     <div class="net-amount">$${rec.netPay.toFixed(2)}</div>
   </div>
@@ -546,6 +663,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 </body>
 </html>`;
 
+    if (openInNewTab) {
+      openHtmlInNewTabForPrint(html);
+      return;
+    }
+
     const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -557,8 +679,20 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  // Download standalone printable HTML for Weekly Payroll Register
-  const handleDownloadRegisterHtml = (weekYmd: string, targetGroup: string, recsList: PayrollRecord[]) => {
+  // Download or open standalone printable HTML for Weekly Payroll Register
+  const handleDownloadRegisterHtml = (
+    weekYmd: string,
+    targetGroup: string,
+    recsList: PayrollRecord[],
+    openInNewTab: boolean = false,
+    customSettings?: StoreSettings
+  ) => {
+    const activeSettings = customSettings || settings;
+    const activeStoreName =
+      activeSettings.storeName && !activeSettings.storeName.includes('Hanaro') && !activeSettings.storeName.includes('CMORE')
+        ? activeSettings.storeName
+        : 'MANAGEMENT OF CULMORE';
+
     const targetRecords = recsList.filter((r) => {
       if (targetGroup === 'ALL') return true;
       return getRecGroup(r).id === targetGroup;
@@ -623,50 +757,50 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 </head>
 <body>
   <div class="no-print" style="background: #0f172a; color: white; padding: 8px 14px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;">
-    <strong>MANAGEMENT OF CULMORE — 공식 주간 급여 대장 (Payroll Register)</strong>
-    <button onclick="window.print()" style="background: #10b981; color: white; border: none; padding: 5px 12px; border-radius: 6px; font-weight: bold; cursor: pointer;">지금 바로 인쇄 (Print)</button>
+    <strong>MANAGEMENT OF CULMORE — ${language === 'ko' ? '공식 주간 급여 대장 (Payroll Register)' : 'Weekly Payroll Register'}</strong>
+    <button onclick="window.print()" style="background: #10b981; color: white; border: none; padding: 5px 12px; border-radius: 6px; font-weight: bold; cursor: pointer;">${language === 'ko' ? '지금 바로 인쇄 (Print)' : 'Print Now'}</button>
   </div>
 
   <div class="header">
     <div>
-      <h1 class="company">${displayStoreName}</h1>
-      <p class="meta">4210 John Marr Dr, Annandale, VA 22003 • EIN: ${settings.ein} • Phone: ${settings.phone}</p>
+      <h1 class="company">${activeStoreName}</h1>
+      <p class="meta">${activeSettings.address}, ${activeSettings.city}, ${activeSettings.state} ${activeSettings.zipCode} • EIN: ${activeSettings.ein} • Phone: ${activeSettings.phone}</p>
       <p class="meta" style="font-weight: bold; color: #047857; margin-top: 3px;">
-        공식 주간 급여 대장 (Weekly Payroll Summary Register) — ${grpObj ? grpObj.name : '전체 5개 사업장 (All Branches)'}
+        ${language === 'ko' ? '공식 주간 급여 대장 (Weekly Payroll Summary Register)' : 'Weekly Payroll Summary Register'} — ${grpObj ? grpObj.name : (language === 'ko' ? '전체 5개 사업장 (All Branches)' : 'All 5 Branches')}
       </p>
     </div>
     <div style="text-align: right;">
-      <div style="font-weight: 900; font-size: 12px;">지급일 (Pay Date): ${weekYmd} (금요일)</div>
-      <div class="meta">급여 정산 기간: ${formatWorkWeekRange(weekYmd, 'ko')}</div>
-      <div class="meta">출력일자: ${new Date().toLocaleDateString('ko-KR')}</div>
+      <div style="font-weight: 900; font-size: 12px;">${language === 'ko' ? '지급일 (Pay Date)' : 'Pay Date'}: ${weekYmd} (${language === 'ko' ? '금요일' : 'Friday'})</div>
+      <div class="meta">${language === 'ko' ? '급여 정산 기간' : 'Pay Period'}: ${formatWorkWeekRange(weekYmd, language)}</div>
+      <div class="meta">${language === 'ko' ? '출력일자' : 'Printed Date'}: ${new Date().toLocaleDateString(language === 'ko' ? 'ko-KR' : 'en-US')}</div>
     </div>
   </div>
 
   <div class="summary-cards">
-    <div class="card"><div class="card-label">대상 인원</div><div class="card-val">${targetRecords.length}명</div></div>
-    <div class="card"><div class="card-label">총 지급액 (Gross)</div><div class="card-val">$${totalGross.toFixed(2)}</div></div>
-    <div class="card"><div class="card-label">총 공제액 (Taxes)</div><div class="card-val" style="color: #b91c1c;">-$${totalTaxes.toFixed(2)}</div></div>
-    <div class="card"><div class="card-label">총 실지급액 (Net)</div><div class="card-val" style="color: #047857;">$${totalNet.toFixed(2)}</div></div>
+    <div class="card"><div class="card-label">${language === 'ko' ? '대상 인원' : 'Headcount'}</div><div class="card-val">${targetRecords.length}${language === 'ko' ? '명' : ' staff'}</div></div>
+    <div class="card"><div class="card-label">${language === 'ko' ? '총 지급액 (Gross)' : 'Gross Earnings'}</div><div class="card-val">$${totalGross.toFixed(2)}</div></div>
+    <div class="card"><div class="card-label">${language === 'ko' ? '총 공제액 (Taxes)' : 'Total Taxes'}</div><div class="card-val" style="color: #b91c1c;">-$${totalTaxes.toFixed(2)}</div></div>
+    <div class="card"><div class="card-label">${language === 'ko' ? '총 실지급액 (Net)' : 'Net Disbursement'}</div><div class="card-val" style="color: #047857;">$${totalNet.toFixed(2)}</div></div>
   </div>
 
   <table>
     <thead>
       <tr>
         <th style="width: 25px; text-align: center;">No</th>
-        <th>직원명</th>
-        <th>사번</th>
-        <th>사업장</th>
-        <th>부서</th>
-        <th style="text-align: right;">시급</th>
-        <th style="text-align: right;">기본h</th>
-        <th style="text-align: right;">연장h</th>
-        <th style="text-align: right;">총급여(Gross)</th>
-        <th style="text-align: right;">연방세</th>
-        <th style="text-align: right;">주소득세</th>
-        <th style="text-align: right;">FICA세</th>
-        <th style="text-align: right;">공제합계</th>
-        <th style="text-align: right;">실지급액(Net)</th>
-        <th>수령인 서명</th>
+        <th>${language === 'ko' ? '직원명' : 'Employee Name'}</th>
+        <th>${language === 'ko' ? '사번' : 'ID'}</th>
+        <th>${language === 'ko' ? '사업장' : 'Branch'}</th>
+        <th>${language === 'ko' ? '부서' : 'Dept'}</th>
+        <th style="text-align: right;">${language === 'ko' ? '시급' : 'Wage'}</th>
+        <th style="text-align: right;">${language === 'ko' ? '기본h' : 'Reg H'}</th>
+        <th style="text-align: right;">${language === 'ko' ? '연장h' : 'OT H'}</th>
+        <th style="text-align: right;">${language === 'ko' ? '총급여(Gross)' : 'Gross Pay'}</th>
+        <th style="text-align: right;">${language === 'ko' ? '연방세' : 'Fed Tax'}</th>
+        <th style="text-align: right;">${language === 'ko' ? '주소득세' : 'VA State'}</th>
+        <th style="text-align: right;">${language === 'ko' ? 'FICA세' : 'FICA'}</th>
+        <th style="text-align: right;">${language === 'ko' ? '공제합계' : 'Total Tax'}</th>
+        <th style="text-align: right;">${language === 'ko' ? '실지급액(Net)' : 'Net Pay'}</th>
+        <th>${language === 'ko' ? '수령인 서명' : 'Signature'}</th>
       </tr>
     </thead>
     <tbody>
@@ -674,7 +808,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     </tbody>
     <tfoot>
       <tr>
-        <td colspan="5" style="font-family: sans-serif; text-transform: uppercase;">합계 (TOTAL - ${targetRecords.length}명)</td>
+        <td colspan="5" style="font-family: sans-serif; text-transform: uppercase;">${language === 'ko' ? `합계 (TOTAL - ${targetRecords.length}명)` : `Total (${targetRecords.length} staff)`}</td>
         <td></td>
         <td style="text-align: right;">${totalRegHours.toFixed(1)}h</td>
         <td style="text-align: right;">${totalOtHours.toFixed(1)}h</td>
@@ -690,9 +824,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   </table>
 
   <div style="margin-top: 20px; display: flex; justify-content: space-between; font-size: 10px; color: #475569;">
-    <div>급여 작성자: __________________________ (서명)</div>
-    <div>총괄 매니저 승인: __________________________ (서명)</div>
-    <div>대표자 승인: __________________________ (서명)</div>
+    <div>${language === 'ko' ? '급여 작성자: __________________________ (서명)' : 'Prepared by: __________________________ (Signature)'}</div>
+    <div>${language === 'ko' ? '총괄 매니저 승인: __________________________ (서명)' : 'General Manager Approval: __________________________ (Signature)'}</div>
+    <div>${language === 'ko' ? '대표자 승인: __________________________ (서명)' : 'Store Owner Approval: __________________________ (Signature)'}</div>
   </div>
 
   <script>
@@ -702,6 +836,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   </script>
 </body>
 </html>`;
+
+    if (openInNewTab) {
+      openHtmlInNewTabForPrint(html);
+      return;
+    }
 
     const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -714,9 +853,12 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     URL.revokeObjectURL(url);
   };
 
-  // CSV Export
+  // CSV Export (strictly registered active employees, respecting selectedGroup)
   const handleExportCsv = () => {
-    if (payrollRecords.length === 0) return;
+    const exportRows = selectedGroup === 'ALL'
+      ? activeWorkingRecords
+      : activeWorkingRecords.filter((r) => getRecGroup(r).id === selectedGroup);
+    if (exportRows.length === 0) return;
 
     const headers = [
       'Store Name',
@@ -742,7 +884,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       'Net Pay ($)',
     ];
 
-    const rows = payrollRecords.map((r) => [
+    const rows = exportRows.map((r) => [
       `"${settings.storeName}"`,
       settings.ein,
       payrollPeriod?.weekStartDate || currentWeekFriday,
@@ -778,6 +920,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
   // Filtered employees for Paystub view: strictly limited to employees who actually worked / have payroll in this period
   const displayedEmployeesForPaystub = employees.filter((emp) => {
+    if (emp.active === false) return false;
     // 1. Must have an active working payroll record with hours/pay
     const rec = activeWorkingRecords.find((r) => r.employeeId === emp.employeeId);
     if (!rec) return false;
@@ -891,6 +1034,29 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
             <span>{language === 'ko' ? '인쇄 옵션 / 다운로드' : 'Print Options'}</span>
           </button>
 
+          {/* Save Final Report & Paystub Package (.json) to Computer */}
+          <button
+            type="button"
+            onClick={handleSaveCurrentFinalToComputer}
+            className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
+            title={language === 'ko' ? '현재 주차 급여명세서·보고서 최종본을 컴퓨터에 .json 파일로 저장합니다' : 'Save final report & paystub archive (.json) to computer'}
+          >
+            <HardDriveDownload className="w-3.5 h-3.5" />
+            <span>{language === 'ko' ? '최종본 컴퓨터 저장' : 'Save Final (.json)'}</span>
+          </button>
+
+          {/* Load Final Archive from Computer (.json) */}
+          <label className="px-3.5 py-2 rounded-xl border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer">
+            <FolderOpen className="w-3.5 h-3.5 text-indigo-600" />
+            <span>{language === 'ko' ? '최종본 불러오기' : 'Load Final'}</span>
+            <input
+              type="file"
+              accept=".json,application/json"
+              onChange={handleUploadArchiveFile}
+              className="hidden"
+            />
+          </label>
+
           {/* Export CSV */}
           <button
             onClick={handleExportCsv}
@@ -902,8 +1068,31 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         </div>
       </div>
 
+      {/* Feedback banner for Final Archive Save / Load */}
+      {archiveFeedback && (
+        <div
+          className={`p-3 rounded-xl font-bold text-xs flex items-center justify-between border no-print ${
+            archiveFeedback.type === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+              : 'bg-rose-50 border-rose-200 text-rose-700'
+          }`}
+        >
+          <div className="flex items-center space-x-2">
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
+            <span>{archiveFeedback.text}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setArchiveFeedback(null)}
+            className="underline text-[11px] ml-2 cursor-pointer"
+          >
+            {language === 'ko' ? '닫기' : 'Dismiss'}
+          </button>
+        </div>
+      )}
+
       {/* Report Tabs (hidden during print) */}
-      <div className="flex space-x-2 border-b border-slate-200 pb-2 no-print">
+      <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-2 no-print">
         <button
           onClick={() => setActiveReportTab('paystub')}
           className={`px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
@@ -936,6 +1125,25 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         >
           {t('historicalSearch')}
         </button>
+
+        <button
+          onClick={() => {
+            setSavedFinalArchives(loadFinalPayrollArchivesLocal());
+            setActiveReportTab('archived');
+          }}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center space-x-1.5 ${
+            activeReportTab === 'archived'
+              ? 'bg-indigo-600 text-white shadow-xs'
+              : 'text-indigo-700 bg-indigo-50/70 hover:bg-indigo-100'
+          }`}
+        >
+          <Archive className="w-3.5 h-3.5" />
+          <span>
+            {language === 'ko'
+              ? `최종본 보관함 · 불러오기 (${savedFinalArchives.length})`
+              : `Final Archives & Load (${savedFinalArchives.length})`}
+          </span>
+        </button>
       </div>
 
       {/* Business Group Tabs Bar (Divided by Group for Paystub & Reports) - Hidden during print */}
@@ -967,7 +1175,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
             <span className={`px-1.5 py-0.2 rounded-full text-[10px] font-mono font-bold ${
               selectedGroup === 'ALL' ? 'bg-white/20 text-white' : 'bg-slate-200 text-slate-700'
             }`}>
-              {employees.length}명
+              {employees.filter((e) => e.active !== false).length}{language === 'ko' ? '명' : ' staff'}
             </span>
             <span className={`text-[10px] font-mono font-bold ${
               selectedGroup === 'ALL' ? 'text-emerald-300' : 'text-emerald-700'
@@ -997,7 +1205,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                 <span className={`px-1.5 py-0.2 rounded text-[10px] font-mono font-bold ${
                   isSelected ? 'bg-white/60 text-slate-900' : 'bg-slate-100 text-slate-600'
                 }`}>
-                  {grp.empCount}명
+                  {grp.empCount}{language === 'ko' ? '명' : ' staff'}
                 </span>
                 {grp.totalNet > 0 && (
                   <span className="text-[10px] font-mono font-bold text-emerald-800">
@@ -1059,29 +1267,35 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                           (e) => getEmpGroup(e).id === grp.id
                         );
                         if (groupEmps.length === 0) return null;
-                        return (
-                          <optgroup key={grp.id} label={`🏢 ${grp.name}`}>
-                            {groupEmps.map((emp) => {
-                              const isCashier = isCashierEmployee(emp.department, emp.position);
-                              return (
-                                <option key={emp.employeeId} value={emp.employeeId}>
-                                  {emp.fullName} {emp.fullNameKo ? `(${emp.fullNameKo})` : ''} [{emp.employeeId}] — {emp.position} ({isCashier ? '캐셔' : '일반'})
-                                </option>
-                              );
-                            })}
-                          </optgroup>
-                        );
-                      })
-                    ) : (
-                      displayedEmployeesForPaystub.map((emp) => {
-                        const grp = getEmpGroup(emp);
-                        const isCashier = isCashierEmployee(emp.department, emp.position);
-                        return (
-                          <option key={emp.employeeId} value={emp.employeeId}>
-                            [{grp.shortName}] {emp.fullName} {emp.fullNameKo ? `(${emp.fullNameKo})` : ''} [{emp.employeeId}] — {emp.position} ({isCashier ? '캐셔' : '일반'})
-                          </option>
-                        );
-                      })
+                            return (
+                              <optgroup key={grp.id} label={`🏢 ${grp.name}`}>
+                                {groupEmps.map((emp) => {
+                                  const isCashier = isCashierEmployee(emp.department, emp.position);
+                                  const cashierLabel = isCashier
+                                    ? (language === 'ko' ? '캐셔' : 'Cashier')
+                                    : (language === 'ko' ? '일반' : 'General');
+                                  return (
+                                    <option key={emp.employeeId} value={emp.employeeId}>
+                                      {emp.fullName} {language === 'ko' && emp.fullNameKo ? `(${emp.fullNameKo})` : ''} [{emp.employeeId}] — {emp.position} ({cashierLabel})
+                                    </option>
+                                  );
+                                })}
+                              </optgroup>
+                            );
+                          })
+                        ) : (
+                          displayedEmployeesForPaystub.map((emp) => {
+                            const grp = getEmpGroup(emp);
+                            const isCashier = isCashierEmployee(emp.department, emp.position);
+                            const cashierLabel = isCashier
+                              ? (language === 'ko' ? '캐셔' : 'Cashier')
+                              : (language === 'ko' ? '일반' : 'General');
+                            return (
+                              <option key={emp.employeeId} value={emp.employeeId}>
+                                [{grp.shortName}] {emp.fullName} {language === 'ko' && emp.fullNameKo ? `(${emp.fullNameKo})` : ''} [{emp.employeeId}] — {emp.position} ({cashierLabel})
+                              </option>
+                            );
+                          })
                     )}
                   </select>
                 </div>
@@ -1116,7 +1330,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   target="_blank"
                   rel="noopener noreferrer"
                   className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
-                  title="새 창에서 열어 브라우저 인쇄 창을 바로 띄웁니다"
+                  title={language === 'ko' ? '새 창에서 열어 브라우저 인쇄 창을 바로 띄웁니다' : 'Open print preview in a new browser tab'}
                 >
                   <Printer className="w-3.5 h-3.5" />
                   <span>{language === 'ko' ? '지금 바로 인쇄하기 (새 창)' : 'Print Paystub (New Tab)'}</span>
@@ -1128,7 +1342,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   type="button"
                   onClick={() => handleDownloadPaystubHtml(selectedRecord, selectedEmployee, currentWeekFriday)}
                   className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center space-x-1.5 transition-colors cursor-pointer"
-                  title="오프라인 보관 및 인쇄용 HTML 파일 다운로드"
+                  title={language === 'ko' ? '오프라인 보관 및 인쇄용 HTML 파일 다운로드' : 'Download standalone HTML file'}
                 >
                   <Download className="w-3.5 h-3.5 text-slate-400" />
                   <span className="hidden sm:inline">{language === 'ko' ? 'HTML 다운로드' : 'Download HTML'}</span>
@@ -1139,7 +1353,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   type="button"
                   onClick={() => handleOpenPrintModal('paystub', selectedRecord.employeeId, currentWeekFriday)}
                   className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center space-x-1.5 transition-colors cursor-pointer"
-                  title="인쇄 옵션 및 안내"
+                  title={language === 'ko' ? '인쇄 옵션 및 안내' : 'Print Options & Guide'}
                 >
                   <Sliders className="w-3.5 h-3.5 text-slate-400" />
                   <span className="hidden sm:inline">{language === 'ko' ? '옵션' : 'Options'}</span>
@@ -1454,7 +1668,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   <span className="text-3xl font-black text-emerald-900 font-mono block">
                     {formatCurrency(selectedRecord.netPay)}
                   </span>
-                  {usdToKrwRate > 0 && (
+                  {usdToKrwRate > 0 && language === 'ko' && (
                     <span className="text-xs font-mono font-bold text-emerald-700 inline-block mt-0.5">
                       ≈ ₩{Math.round(selectedRecord.netPay * usdToKrwRate).toLocaleString()} <span className="text-[10px] text-emerald-600 font-normal">(실시간 환율 $1 = ₩{usdToKrwRate.toFixed(1)})</span>
                     </span>
@@ -1580,7 +1794,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                                 <span>{r.employeeName}</span>
                                 {isCashier && (
                                   <span className="px-1 py-0.2 rounded text-[9px] font-bold bg-amber-100 text-amber-800">
-                                    캐셔
+                                    {language === 'ko' ? '캐셔' : 'Cashier'}
                                   </span>
                                 )}
                                 {r.isAdjusted && (
@@ -1620,7 +1834,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         <td colSpan={4} className="py-3 px-3 uppercase font-sans font-black text-xs text-slate-800">
                           {selectedGroup === 'ALL'
                             ? (language === 'ko' ? '전체 사업장 합계 (Total 5 Branches)' : 'Grand Total (All Branches)')
-                            : `${getBusinessGroup(selectedGroup).shortName} 소계 (Subtotal)`}
+                            : `${getBusinessGroup(selectedGroup).shortName} ${language === 'ko' ? '소계 (Subtotal)' : 'Subtotal'}`}
                         </td>
                         <td className="py-3 px-2 text-right text-slate-900">{sumRegHours.toFixed(1)}</td>
                         <td className="py-3 px-2 text-right text-amber-800">
@@ -1643,8 +1857,10 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
       {/* TAB 3: HISTORICAL PAYROLL RECORDS BY PAY DATE */}
       {activeReportTab === 'historical' && (() => {
-        // Filter historical records by selected business group & search
+        // Filter historical records strictly to registered active employees, selected business group & search
         const displayedHistoricalRecords = historicalRecords.filter((r) => {
+          const emp = employees.find((e) => e.employeeId === r.employeeId);
+          if (!emp || emp.active === false) return false;
           const hasWork =
             r.regularHours > 0 ||
             r.overtimeHours > 0 ||
@@ -1653,8 +1869,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
           if (!hasWork) return false;
 
           if (selectedGroup !== 'ALL') {
-            const emp = employees.find((e) => e.employeeId === r.employeeId);
-            const grp = getBusinessGroup(r.businessGroup || r.groupNumber || emp?.businessGroup || emp?.groupNumber);
+            const grp = getBusinessGroup(r.businessGroup || r.groupNumber || emp.businessGroup || emp.groupNumber);
             if (grp.id !== selectedGroup) return false;
           }
           if (searchFilter.trim()) {
@@ -1675,13 +1890,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         const histTaxes = displayedHistoricalRecords.reduce((sum, r) => sum + r.totalTaxes, 0);
         const histNet = displayedHistoricalRecords.reduce((sum, r) => sum + r.netPay, 0);
 
-        // Selected single historical paystub
-        const histRecord = historicalRecords.find((r) => r.employeeId === selectedHistoricalEmpId);
-        const histEmployee = employees.find((e) => e.employeeId === selectedHistoricalEmpId);
+        // Selected single historical paystub (only active registered employee)
+        const histEmployee = employees.find((e) => e.employeeId === selectedHistoricalEmpId && e.active);
+        const histRecord = histEmployee
+          ? displayedHistoricalRecords.find((r) => r.employeeId === selectedHistoricalEmpId)
+          : undefined;
         const histEmpGroup = getEmpGroup(histEmployee);
 
         const handleExportHistoricalCsv = () => {
-          if (historicalRecords.length === 0) return;
+          if (displayedHistoricalRecords.length === 0) return;
 
           const headers = [
             'Store Name',
@@ -1709,7 +1926,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
             'Net Pay ($)',
           ];
 
-          const rows = historicalRecords.map((r) => {
+          const rows = displayedHistoricalRecords.map((r) => {
             const emp = employees.find((e) => e.employeeId === r.employeeId);
             const grp = getBusinessGroup(r.businessGroup || r.groupNumber || emp?.businessGroup || emp?.groupNumber);
             return [
@@ -2042,20 +2259,24 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     const isCur = p.weekStartDate === currentWeekFriday;
                     return (
                       <option key={p.id || p.weekStartDate} value={p.weekStartDate}>
-                        [지급일: {p.weekStartDate} (금)] {p.weekStartDate} ~ {p.weekEndDate} {isCur ? '★ 현재' : ''} • {p.status === 'finalized' ? '마감완료' : '작성중'} • Net ${p.totalNetPay.toLocaleString()}
+                        {language === 'ko'
+                          ? `[지급일: ${p.weekStartDate} (금)] ${p.weekStartDate} ~ ${p.weekEndDate} ${isCur ? '★ 현재' : ''} • ${p.status === 'finalized' ? '마감완료' : '작성중'} • Net $${p.totalNetPay.toLocaleString()}`
+                          : `[Pay Date: ${p.weekStartDate} (Fri)] ${p.weekStartDate} ~ ${p.weekEndDate} ${isCur ? '★ Current' : ''} • ${p.status === 'finalized' ? 'Finalized' : 'Draft'} • Net $${p.totalNetPay.toLocaleString()}`}
                       </option>
                     );
                   })}
                   {!allRecordedPeriods.some((p) => p.weekStartDate === selectedHistoricalFriday) && (
                     <option value={selectedHistoricalFriday}>
-                      [선택일: {selectedHistoricalFriday} (금)]
+                      {language === 'ko'
+                        ? `[선택일: ${selectedHistoricalFriday} (금)]`
+                        : `[Selected: ${selectedHistoricalFriday} (Fri)]`}
                     </option>
                   )}
                 </select>
 
                 {/* Direct Calendar Date Input */}
                 <div className="flex items-center space-x-1">
-                  <span className="text-[11px] text-slate-400">달력:</span>
+                  <span className="text-[11px] text-slate-400">{language === 'ko' ? '달력:' : 'Calendar:'}</span>
                   <input
                     type="date"
                     value={selectedHistoricalFriday}
@@ -2071,7 +2292,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   />
                 </div>
 
-                {/* Stepper buttons (< 이전 주 / 다음 주 >) */}
+                {/* Stepper buttons (< Prev / Next >) */}
                 <div className="flex items-center space-x-1">
                   <button
                     type="button"
@@ -2081,7 +2302,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       setHistoricalViewMode('table');
                     }}
                     className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 font-bold text-xs flex items-center space-x-1 transition-colors cursor-pointer"
-                    title="1주 전으로 이동"
+                    title={language === 'ko' ? '1주 전으로 이동' : 'Go to previous week'}
                   >
                     <ChevronLeft className="w-3.5 h-3.5" />
                     <span>{language === 'ko' ? '이전 주' : 'Prev Week'}</span>
@@ -2094,7 +2315,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       setHistoricalViewMode('table');
                     }}
                     className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 font-bold text-xs flex items-center space-x-1 transition-colors cursor-pointer"
-                    title="1주 후로 이동"
+                    title={language === 'ko' ? '1주 후로 이동' : 'Go to next week'}
                   >
                     <span>{language === 'ko' ? '다음 주' : 'Next Week'}</span>
                     <ChevronRight className="w-3.5 h-3.5" />
@@ -2198,7 +2419,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     </span>
                   )}
                   <span className="font-mono text-slate-500">
-                    조회된 직원: {displayedHistoricalRecords.length}명
+                    {language === 'ko' ? `조회된 직원: ${displayedHistoricalRecords.length}명` : `Found: ${displayedHistoricalRecords.length} staff`}
                   </span>
                 </div>
               </div>
@@ -2233,11 +2454,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       : (language === 'ko' ? '작성 중 (Draft)' : 'Draft')}
                   </span>
                   <span className="text-xs font-mono font-bold text-slate-700">
-                    {displayedHistoricalRecords.length}명
+                    {displayedHistoricalRecords.length}{language === 'ko' ? '명' : ' staff'}
                   </span>
                 </div>
                 <span className="text-[10px] text-slate-400 font-mono block mt-0.5">
-                  총 {histRegHours.toFixed(1)}h (OT +{histOtHours.toFixed(1)}h)
+                  {language === 'ko' ? '총 ' : 'Total '}{histRegHours.toFixed(1)}h (OT +{histOtHours.toFixed(1)}h)
                 </span>
               </div>
 
@@ -2249,7 +2470,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   {formatCurrency(histGross)}
                 </span>
                 <span className="text-[10px] text-rose-600 font-mono block">
-                  세금 공제 -{formatCurrency(histTaxes)}
+                  {language === 'ko' ? '세금 공제 ' : 'Taxes '}-{formatCurrency(histTaxes)}
                 </span>
               </div>
 
@@ -2260,7 +2481,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                 <span className="text-base font-black text-emerald-900 font-mono block mt-0.5">
                   {formatCurrency(histNet)}
                 </span>
-                {usdToKrwRate > 0 && (
+                {usdToKrwRate > 0 && language === 'ko' && (
                   <span className="text-[10px] text-emerald-700 font-mono font-bold block truncate">
                     ≈ ₩{Math.round(histNet * usdToKrwRate).toLocaleString()}
                   </span>
@@ -2274,18 +2495,18 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                 <table className="w-full text-left border-collapse text-xs">
                   <thead>
                     <tr className="bg-slate-50 text-slate-600 font-bold border-b border-slate-200 uppercase tracking-wider">
-                      <th className="py-2.5 px-3">사번 (ID)</th>
-                      <th className="py-2.5 px-3">직원명 (Employee)</th>
-                      <th className="py-2.5 px-3">사업장 (Group)</th>
-                      <th className="py-2.5 px-3">부서 / 직책</th>
-                      <th className="py-2.5 px-2 text-right">정규시간</th>
-                      <th className="py-2.5 px-2 text-right">연장시간</th>
-                      <th className="py-2.5 px-3 text-right">총급여 ($)</th>
-                      <th className="py-2.5 px-3 text-right">세금 합계 ($)</th>
+                      <th className="py-2.5 px-3">{language === 'ko' ? '사번 (ID)' : 'ID'}</th>
+                      <th className="py-2.5 px-3">{language === 'ko' ? '직원명 (Employee)' : 'Employee'}</th>
+                      <th className="py-2.5 px-3">{language === 'ko' ? '사업장 (Group)' : 'Group'}</th>
+                      <th className="py-2.5 px-3">{language === 'ko' ? '부서 / 직책' : 'Dept / Role'}</th>
+                      <th className="py-2.5 px-2 text-right">{language === 'ko' ? '정규시간' : 'Reg H'}</th>
+                      <th className="py-2.5 px-2 text-right">{language === 'ko' ? '연장시간' : 'OT H'}</th>
+                      <th className="py-2.5 px-3 text-right">{language === 'ko' ? '총급여 ($)' : 'Gross ($)'}</th>
+                      <th className="py-2.5 px-3 text-right">{language === 'ko' ? '세금 합계 ($)' : 'Taxes ($)'}</th>
                       <th className="py-2.5 px-3 text-right bg-emerald-50 text-emerald-950 font-black">
-                        실수령액 ($)
+                        {language === 'ko' ? '실수령액 ($)' : 'Net Pay ($)'}
                       </th>
-                      <th className="py-2.5 px-3 text-center">출력 / 상세</th>
+                      <th className="py-2.5 px-3 text-center">{language === 'ko' ? '출력 / 상세' : 'Actions'}</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-mono">
@@ -2317,7 +2538,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                                 <span>{r.employeeName}</span>
                                 {isCashier && (
                                   <span className="px-1 py-0.2 rounded text-[9px] font-bold bg-amber-100 text-amber-800">
-                                    캐셔
+                                    {language === 'ko' ? '캐셔' : 'Cashier'}
                                   </span>
                                 )}
                                 {r.isAdjusted && (
@@ -2357,7 +2578,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                                   setHistoricalViewMode('paystub');
                                 }}
                                 className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-sans font-bold shadow-2xs transition-colors cursor-pointer flex items-center space-x-1 mx-auto"
-                                title="이 직원의 과거 급여명세서를 확인하고 바로 인쇄합니다"
+                                title={language === 'ko' ? '이 직원의 과거 급여명세서를 확인하고 바로 인쇄합니다' : 'View and print this employee historical paystub'}
                               >
                                 <Eye className="w-3 h-3" />
                                 <span>{language === 'ko' ? '명세서 인쇄' : 'Paystub'}</span>
@@ -2374,7 +2595,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         <td colSpan={4} className="py-3 px-3 uppercase font-sans font-black text-xs text-slate-800">
                           {selectedGroup === 'ALL'
                             ? (language === 'ko' ? '전체 사업장 합계 (Total 5 Branches)' : 'Grand Total (All Branches)')
-                            : `${getBusinessGroup(selectedGroup).shortName} 소계 (Subtotal)`}
+                            : `${getBusinessGroup(selectedGroup).shortName} ${language === 'ko' ? '소계 (Subtotal)' : 'Subtotal'}`}
                         </td>
                         <td className="py-3 px-2 text-right text-slate-900">{histRegHours.toFixed(1)}</td>
                         <td className="py-3 px-2 text-right text-amber-800">
@@ -2407,7 +2628,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                 </div>
                 <div className="text-right">
                   <h2 className="text-sm font-black uppercase text-slate-900">
-                    WEEKLY PAYROLL REGISTER (급여 대장)
+                    {language === 'ko' ? 'WEEKLY PAYROLL REGISTER (급여 대장)' : 'WEEKLY PAYROLL REGISTER'}
                   </h2>
                   <p className="text-xs text-slate-700 font-mono font-bold">
                     Pay Date: {selectedHistoricalFriday} (Friday)
@@ -2508,18 +2729,616 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         );
       })()}
 
+      {/* 4. Finalized Payroll Archives & Load From Computer Tab */}
+      {activeReportTab === 'archived' && (() => {
+        const archiveRecordsFiltered = loadedArchive
+          ? loadedArchive.records.filter((r) => {
+              if (selectedGroup === 'ALL') return true;
+              const matchedEmp = loadedArchive.employees.find((e) => e.employeeId === r.employeeId);
+              const grp = getBusinessGroup(
+                r.businessGroup || r.groupNumber || matchedEmp?.businessGroup || matchedEmp?.groupNumber
+              );
+              return grp.id === selectedGroup;
+            })
+          : [];
+
+        const selectedArchRec =
+          archiveRecordsFiltered.find((r) => r.employeeId === archiveEmpId) || archiveRecordsFiltered[0];
+        const selectedArchEmp =
+          loadedArchive && selectedArchRec
+            ? loadedArchive.employees.find((e) => e.employeeId === selectedArchRec.employeeId)
+            : undefined;
+
+        const archTotalReg = archiveRecordsFiltered.reduce((s, r) => s + r.regularHours, 0);
+        const archTotalOt = archiveRecordsFiltered.reduce((s, r) => s + r.overtimeHours, 0);
+        const archTotalGross = archiveRecordsFiltered.reduce((s, r) => s + r.grossPay, 0);
+        const archTotalTaxes = archiveRecordsFiltered.reduce((s, r) => s + r.totalTaxes, 0);
+        const archTotalNet = archiveRecordsFiltered.reduce((s, r) => s + r.netPay, 0);
+
+        return (
+          <div className="space-y-6 no-print">
+            {/* Archive Header & Computer File Actions */}
+            <div className="bg-white rounded-2xl border border-indigo-200 shadow-xs p-5 space-y-4">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="flex items-start space-x-3">
+                  <div className="w-10 h-10 rounded-xl bg-indigo-100 text-indigo-700 flex items-center justify-center shrink-0">
+                    <Archive className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-black text-slate-900">
+                      {language === 'ko'
+                        ? '급여명세서 & 보고서 최종본 자동 저장 및 컴퓨터 불러오기'
+                        : 'Final Report & Paystub Archives (Auto-Save & Computer Load)'}
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      {language === 'ko'
+                        ? '급여 마감(Finalize) 시 최종본이 브라우저 보관함과 컴퓨터 파일(.json)로 자동 저장됩니다. 언제든 컴퓨터에서 파일을 불러와 급여대장 및 개별 급여명세서를 열람하고 바로 인쇄할 수 있습니다.'
+                        : 'Finalized payrolls are automatically saved to archive history and downloaded to your computer (.json). Load any saved file below to review and print reports or employee paystubs.'}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={handleSaveCurrentFinalToComputer}
+                    className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
+                  >
+                    <HardDriveDownload className="w-3.5 h-3.5" />
+                    <span>{language === 'ko' ? '현재 주차 최종본 컴퓨터 저장' : 'Save Current Final (.json)'}</span>
+                  </button>
+
+                  <label className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer">
+                    <Upload className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>{language === 'ko' ? '컴퓨터에서 최종본 열기 (.json)' : 'Open File From Computer (.json)'}</span>
+                    <input
+                      type="file"
+                      accept=".json,application/json"
+                      onChange={handleUploadArchiveFile}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+              </div>
+
+              {/* Saved Local Archives List */}
+              <div className="pt-3 border-t border-slate-100">
+                <div className="flex items-center justify-between mb-2.5">
+                  <h3 className="text-xs font-black text-slate-700 uppercase tracking-wider">
+                    {language === 'ko'
+                      ? `자동 저장된 최종본 기록 (${savedFinalArchives.length}건)`
+                      : `Auto-Saved Final Archives (${savedFinalArchives.length})`}
+                  </h3>
+                  <span className="text-[11px] text-slate-400">
+                    {language === 'ko' ? '최근 30주간 자동 보관됨' : 'Up to 30 most recent snapshots'}
+                  </span>
+                </div>
+
+                {savedFinalArchives.length === 0 ? (
+                  <div className="p-6 text-center bg-slate-50 rounded-xl border border-dashed border-slate-200 text-xs text-slate-500">
+                    {language === 'ko'
+                      ? '아직 저장된 최종본 기록이 없습니다. [급여 및 세금 계산]에서 급여를 마감하거나 상단 [현재 주차 최종본 컴퓨터 저장] 버튼을 눌러 저장하세요.'
+                      : 'No archived final snapshots yet. Finalize a payroll period or click "Save Current Final (.json)" to create one.'}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 max-h-64 overflow-y-auto pr-1">
+                    {savedFinalArchives.map((arch) => {
+                      const isLoaded = loadedArchive?.id === arch.id;
+                      const netTotal = arch.records.reduce((s, r) => s + r.netPay, 0);
+                      return (
+                        <div
+                          key={arch.id}
+                          className={`p-3 rounded-xl border transition-all flex flex-col justify-between gap-2 ${
+                            isLoaded
+                              ? 'border-indigo-500 bg-indigo-50/70 ring-2 ring-indigo-200'
+                              : 'border-slate-200 bg-slate-50/60 hover:bg-white'
+                          }`}
+                        >
+                          <div>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs font-black text-slate-900 font-mono">
+                                {arch.period.weekStartDate} ~ {arch.period.weekEndDate}
+                              </span>
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                  arch.period.status === 'finalized'
+                                    ? 'bg-emerald-100 text-emerald-800'
+                                    : 'bg-amber-100 text-amber-800'
+                                }`}
+                              >
+                                {arch.period.status === 'finalized'
+                                  ? language === 'ko'
+                                    ? '마감완료'
+                                    : 'Finalized'
+                                  : language === 'ko'
+                                  ? '임시저장'
+                                  : 'Snapshot'}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-slate-600 mt-1 flex items-center justify-between font-mono">
+                              <span>
+                                {arch.records.length}
+                                {language === 'ko' ? '명' : ' staff'}
+                              </span>
+                              <span className="font-bold text-emerald-700">Net {formatCurrency(netTotal)}</span>
+                            </div>
+                            <div className="text-[10px] text-slate-400 mt-1">
+                              {new Date(arch.savedAt).toLocaleString(language === 'ko' ? 'ko-KR' : 'en-US')}
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 pt-2 border-t border-slate-200/70">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setLoadedArchive(arch);
+                                setArchiveEmpId(arch.records[0]?.employeeId || '');
+                                setArchiveSubView('register');
+                              }}
+                              className="flex-1 px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-bold flex items-center justify-center space-x-1 transition-colors cursor-pointer"
+                            >
+                              <Eye className="w-3 h-3" />
+                              <span>{language === 'ko' ? '열람 · 인쇄' : 'View & Print'}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const fn = downloadFinalPayrollArchiveToComputer(arch);
+                                setArchiveFeedback({
+                                  type: 'success',
+                                  text:
+                                    language === 'ko'
+                                      ? `파일(${fn})이 컴퓨터에 다운로드되었습니다.`
+                                      : `Downloaded archive file (${fn}) to your computer.`,
+                                });
+                              }}
+                              className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 text-[11px] font-bold flex items-center space-x-1 transition-colors cursor-pointer"
+                              title={language === 'ko' ? '이 최종본을 컴퓨터에 .json으로 저장' : 'Download .json to computer'}
+                            >
+                              <Download className="w-3 h-3" />
+                              <span>.json</span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Loaded Archive Viewer */}
+            {loadedArchive && (
+              <div className="bg-white rounded-2xl border-2 border-indigo-300 shadow-sm overflow-hidden">
+                {/* Archive Viewer Toolbar */}
+                <div className="p-4 bg-indigo-50/70 border-b border-indigo-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                  <div>
+                    <div className="flex items-center space-x-2">
+                      <span className="px-2 py-0.5 rounded bg-indigo-600 text-white text-[10px] font-black uppercase">
+                        {language === 'ko' ? '불러온 최종본' : 'Loaded Final Archive'}
+                      </span>
+                      <span className="text-sm font-black text-slate-900 font-mono">
+                        {loadedArchive.period.weekStartDate} ~ {loadedArchive.period.weekEndDate}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-600 mt-1">
+                      {language === 'ko'
+                        ? `저장일시: ${new Date(loadedArchive.savedAt).toLocaleString('ko-KR')} • 처리자: ${loadedArchive.finalizedBy} • 표시 인원: ${archiveRecordsFiltered.length}명`
+                        : `Saved: ${new Date(loadedArchive.savedAt).toLocaleString('en-US')} • By: ${loadedArchive.finalizedBy} • Showing ${archiveRecordsFiltered.length} staff`}
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex bg-white p-1 rounded-xl border border-indigo-200">
+                      <button
+                        type="button"
+                        onClick={() => setArchiveSubView('register')}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                          archiveSubView === 'register'
+                            ? 'bg-indigo-600 text-white'
+                            : 'text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        {language === 'ko' ? '주간 급여 대장' : 'Payroll Register'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setArchiveSubView('paystub')}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                          archiveSubView === 'paystub'
+                            ? 'bg-indigo-600 text-white'
+                            : 'text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        {language === 'ko' ? '직원별 급여명세서' : 'Employee Paystub'}
+                      </button>
+                    </div>
+
+                    {archiveSubView === 'register' ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleDownloadRegisterHtml(
+                              loadedArchive.period.weekStartDate,
+                              selectedGroup,
+                              loadedArchive.records,
+                              true,
+                              loadedArchive.settings
+                            )
+                          }
+                          className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
+                        >
+                          <Printer className="w-3.5 h-3.5" />
+                          <span>{language === 'ko' ? '보고서 바로 인쇄' : 'Print Register'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleDownloadRegisterHtml(
+                              loadedArchive.period.weekStartDate,
+                              selectedGroup,
+                              loadedArchive.records,
+                              false,
+                              loadedArchive.settings
+                            )
+                          }
+                          className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold flex items-center space-x-1.5 transition-colors cursor-pointer"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>{language === 'ko' ? 'HTML 저장' : 'Download HTML'}</span>
+                        </button>
+                      </>
+                    ) : (
+                      selectedArchRec && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleDownloadPaystubHtml(
+                                selectedArchRec,
+                                selectedArchEmp,
+                                loadedArchive.period.weekStartDate,
+                                true,
+                                loadedArchive.settings
+                              )
+                            }
+                            className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
+                          >
+                            <Printer className="w-3.5 h-3.5" />
+                            <span>{language === 'ko' ? '선택 명세서 바로 인쇄' : 'Print Paystub'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleDownloadPaystubHtml(
+                                selectedArchRec,
+                                selectedArchEmp,
+                                loadedArchive.period.weekStartDate,
+                                false,
+                                loadedArchive.settings
+                              )
+                            }
+                            className="px-3 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold flex items-center space-x-1.5 transition-colors cursor-pointer"
+                          >
+                            <Download className="w-3.5 h-3.5" />
+                            <span>{language === 'ko' ? 'HTML 저장' : 'Download HTML'}</span>
+                          </button>
+                        </>
+                      )
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => setLoadedArchive(null)}
+                      className="p-2 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-white transition-colors cursor-pointer"
+                      title={language === 'ko' ? '닫기' : 'Close Archive View'}
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Archive Subview: Register Table */}
+                {archiveSubView === 'register' && (
+                  <div className="p-5 space-y-4">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                      <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                        <div className="text-[11px] font-bold text-slate-500">
+                          {language === 'ko' ? '대상 인원 / 근무시간' : 'Headcount / Hours'}
+                        </div>
+                        <div className="text-base font-black text-slate-900 font-mono mt-0.5">
+                          {archiveRecordsFiltered.length}
+                          {language === 'ko' ? '명' : ' staff'} • {(archTotalReg + archTotalOt).toFixed(1)}h
+                        </div>
+                      </div>
+                      <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                        <div className="text-[11px] font-bold text-slate-500">
+                          {language === 'ko' ? '총 지급액 (Gross)' : 'Gross Pay'}
+                        </div>
+                        <div className="text-base font-black text-slate-900 font-mono mt-0.5">
+                          {formatCurrency(archTotalGross)}
+                        </div>
+                      </div>
+                      <div className="p-3 rounded-xl bg-rose-50 border border-rose-200">
+                        <div className="text-[11px] font-bold text-rose-700">
+                          {language === 'ko' ? '총 세금 공제 (Taxes)' : 'Total Taxes'}
+                        </div>
+                        <div className="text-base font-black text-rose-700 font-mono mt-0.5">
+                          -{formatCurrency(archTotalTaxes)}
+                        </div>
+                      </div>
+                      <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200">
+                        <div className="text-[11px] font-bold text-emerald-700">
+                          {language === 'ko' ? '총 실지급액 (Net)' : 'Total Net Pay'}
+                        </div>
+                        <div className="text-base font-black text-emerald-800 font-mono mt-0.5">
+                          {formatCurrency(archTotalNet)}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                      <table className="w-full text-left text-xs font-mono">
+                        <thead className="bg-slate-900 text-white text-[11px] font-sans uppercase">
+                          <tr>
+                            <th className="py-2.5 px-3">{language === 'ko' ? '직원명' : 'Employee'}</th>
+                            <th className="py-2.5 px-3">{language === 'ko' ? '사업장' : 'Group'}</th>
+                            <th className="py-2.5 px-3 text-right">{language === 'ko' ? '기본/OT' : 'Reg/OT'}</th>
+                            <th className="py-2.5 px-3 text-right">{language === 'ko' ? '총급여' : 'Gross'}</th>
+                            <th className="py-2.5 px-3 text-right">{language === 'ko' ? '총세금' : 'Taxes'}</th>
+                            <th className="py-2.5 px-3 text-right">{language === 'ko' ? '지급방식' : 'Method'}</th>
+                            <th className="py-2.5 px-3 text-right">{language === 'ko' ? '실지급액' : 'Net Pay'}</th>
+                            <th className="py-2.5 px-3 text-center">{language === 'ko' ? '명세서' : 'Paystub'}</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {archiveRecordsFiltered.length === 0 ? (
+                            <tr>
+                              <td colSpan={8} className="py-8 text-center font-sans text-slate-400">
+                                {language === 'ko'
+                                  ? '선택한 사업장 그룹에 해당하는 최종본 데이터가 없습니다.'
+                                  : 'No records for the selected business group in this archive.'}
+                              </td>
+                            </tr>
+                          ) : (
+                            archiveRecordsFiltered.map((r) => {
+                              const matchedEmp = loadedArchive.employees.find((e) => e.employeeId === r.employeeId);
+                              const grp = getBusinessGroup(
+                                r.businessGroup || r.groupNumber || matchedEmp?.businessGroup || matchedEmp?.groupNumber
+                              );
+                              return (
+                                <tr key={r.id} className="hover:bg-slate-50">
+                                  <td className="py-2.5 px-3 font-sans font-bold text-slate-900">
+                                    {r.employeeName}{' '}
+                                    <span className="text-[10px] font-mono text-slate-400">({r.employeeId})</span>
+                                  </td>
+                                  <td className="py-2.5 px-3 font-sans">
+                                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${grp.badgeBg}`}>
+                                      {grp.shortName}
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right">
+                                    {r.regularHours.toFixed(1)}h
+                                    {r.overtimeHours > 0 ? ` / +${r.overtimeHours.toFixed(1)}h` : ''}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-bold">{formatCurrency(r.grossPay)}</td>
+                                  <td className="py-2.5 px-3 text-right text-rose-700">
+                                    -{formatCurrency(r.totalTaxes)}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-sans text-[11px]">
+                                    {r.paymentMethod === 'SPLIT'
+                                      ? `Split ($${(r.checkAmount ?? 0).toFixed(0)} / $${(r.cashAmount ?? 0).toFixed(0)})`
+                                      : r.paymentMethod === 'ALL_CASH'
+                                      ? 'All Cash'
+                                      : 'All Check'}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-black text-emerald-700">
+                                    {formatCurrency(r.netPay)}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-center">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setArchiveEmpId(r.employeeId);
+                                        setArchiveSubView('paystub');
+                                      }}
+                                      className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-sans font-bold cursor-pointer"
+                                    >
+                                      {language === 'ko' ? '명세서 보기' : 'Paystub'}
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* Archive Subview: Individual Employee Paystub */}
+                {archiveSubView === 'paystub' && (
+                  <div className="p-5 space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+                      <div className="flex items-center space-x-2">
+                        <User className="w-4 h-4 text-indigo-600" />
+                        <span className="text-xs font-bold text-slate-700">
+                          {language === 'ko' ? '직원 선택:' : 'Select Employee:'}
+                        </span>
+                        <select
+                          value={selectedArchRec?.employeeId || ''}
+                          onChange={(e) => setArchiveEmpId(e.target.value)}
+                          className="px-3 py-1.5 rounded-xl border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 cursor-pointer"
+                        >
+                          {archiveRecordsFiltered.map((r) => (
+                            <option key={r.id} value={r.employeeId}>
+                              {r.employeeName} ({r.employeeId}) — Net {formatCurrency(r.netPay)}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {selectedArchRec && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleDownloadPaystubHtml(
+                              selectedArchRec,
+                              selectedArchEmp,
+                              loadedArchive.period.weekStartDate,
+                              true,
+                              loadedArchive.settings
+                            )
+                          }
+                          className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center space-x-1.5 cursor-pointer"
+                        >
+                          <Printer className="w-3.5 h-3.5" />
+                          <span>{language === 'ko' ? '이 급여명세서 바로 인쇄' : 'Print This Paystub'}</span>
+                        </button>
+                      )}
+                    </div>
+
+                    {selectedArchRec ? (
+                      <div className="border border-slate-300 rounded-xl p-6 bg-white space-y-5">
+                        <div className="flex justify-between items-start border-b-2 border-slate-900 pb-3">
+                          <div>
+                            <h3 className="text-lg font-black text-slate-900 uppercase">
+                              {loadedArchive.settings.storeName || displayStoreName}
+                            </h3>
+                            <p className="text-xs text-slate-500">
+                              {loadedArchive.settings.address}, {loadedArchive.settings.city},{' '}
+                              {loadedArchive.settings.state} {loadedArchive.settings.zipCode} • EIN:{' '}
+                              {loadedArchive.settings.ein}
+                            </p>
+                          </div>
+                          <div className="text-right">
+                            <span className="px-2 py-1 rounded bg-slate-900 text-white text-[10px] font-bold uppercase">
+                              ARCHIVED FINAL PAYSTUB
+                            </span>
+                            <p className="text-xs font-bold text-slate-800 font-mono mt-1">
+                              Pay Date: {loadedArchive.period.weekStartDate}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs">
+                          <div>
+                            <div className="text-[10px] text-slate-500 font-bold uppercase">Employee</div>
+                            <div className="font-black text-slate-900">{selectedArchRec.employeeName}</div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-slate-500 font-bold uppercase">ID / Dept</div>
+                            <div className="font-bold text-slate-700">
+                              {selectedArchRec.employeeId} • {selectedArchRec.department}
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-slate-500 font-bold uppercase">Wage Rate</div>
+                            <div className="font-bold text-emerald-700 font-mono">
+                              ${selectedArchRec.hourlyWage.toFixed(2)}/hr
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[10px] text-slate-500 font-bold uppercase">Payment Split</div>
+                            <div className="font-bold text-indigo-700 font-mono">
+                              Chk ${(selectedArchRec.checkAmount ?? selectedArchRec.netPay).toFixed(2)} / Csh $
+                              {(selectedArchRec.cashAmount ?? 0).toFixed(2)}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                          <div className="border border-slate-200 rounded-xl overflow-hidden">
+                            <div className="bg-slate-100 px-3 py-2 font-bold text-slate-700">EARNINGS</div>
+                            <div className="p-3 space-y-1.5 font-mono">
+                              <div className="flex justify-between">
+                                <span>Regular ({selectedArchRec.regularHours.toFixed(2)}h)</span>
+                                <span className="font-bold">{formatCurrency(selectedArchRec.regularPay)}</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Overtime ({selectedArchRec.overtimeHours.toFixed(2)}h)</span>
+                                <span className="font-bold">{formatCurrency(selectedArchRec.overtimePay)}</span>
+                              </div>
+                              <div className="flex justify-between pt-2 border-t border-slate-200 font-black text-slate-900">
+                                <span>Gross Pay</span>
+                                <span>{formatCurrency(selectedArchRec.grossPay)}</span>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="border border-slate-200 rounded-xl overflow-hidden">
+                            <div className="bg-slate-100 px-3 py-2 font-bold text-slate-700">TAXES & DEDUCTIONS</div>
+                            <div className="p-3 space-y-1.5 font-mono">
+                              <div className="flex justify-between">
+                                <span>Federal Tax (FIT)</span>
+                                <span className="text-rose-700">
+                                  -{formatCurrency(selectedArchRec.federalWithholding)}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Virginia Tax (SIT)</span>
+                                <span className="text-rose-700">-{formatCurrency(selectedArchRec.vaWithholding)}</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span>Social Security + Medicare</span>
+                                <span className="text-rose-700">
+                                  -
+                                  {formatCurrency(
+                                    selectedArchRec.socialSecurityTax + selectedArchRec.medicareTax
+                                  )}
+                                </span>
+                              </div>
+                              <div className="flex justify-between pt-2 border-t border-slate-200 font-black text-rose-800">
+                                <span>Total Deductions</span>
+                                <span>-{formatCurrency(selectedArchRec.totalDeductions)}</span>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="p-4 rounded-xl bg-emerald-50 border-2 border-emerald-300 flex items-center justify-between">
+                          <div>
+                            <div className="text-xs font-bold text-emerald-800">
+                              {language === 'ko' ? '실지급액 (NET PAY)' : 'NET PAY'}
+                            </div>
+                            <div className="text-[11px] text-emerald-700 font-mono">
+                              Check: ${(selectedArchRec.checkAmount ?? selectedArchRec.netPay).toFixed(2)} | Cash: $
+                              {(selectedArchRec.cashAmount ?? 0).toFixed(2)}
+                            </div>
+                          </div>
+                          <div className="text-2xl font-black text-emerald-900 font-mono">
+                            {formatCurrency(selectedArchRec.netPay)}
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="p-6 text-center text-xs text-slate-400">
+                        {language === 'ko'
+                          ? '표시할 직원 급여명세서가 없습니다.'
+                          : 'No employee paystub available for the selected group.'}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {/* Comprehensive Print & Export Modal */}
       {isPrintModalOpen && (() => {
+        const modalEmp = employees.find((e) => e.employeeId === printModalTargetEmpId && e.active);
         const modalRec =
-          printModalType === 'paystub'
+          printModalType === 'paystub' && modalEmp
             ? (printModalTargetWeek === currentWeekFriday
-                ? payrollRecords.find((r) => r.employeeId === printModalTargetEmpId)
+                ? activeWorkingRecords.find((r) => r.employeeId === printModalTargetEmpId)
                 : historicalRecords.find((r) => r.employeeId === printModalTargetEmpId)) ||
-              payrollRecords.find((r) => r.employeeId === printModalTargetEmpId) ||
+              activeWorkingRecords.find((r) => r.employeeId === printModalTargetEmpId) ||
               historicalRecords.find((r) => r.employeeId === printModalTargetEmpId)
             : null;
-
-        const modalEmp = employees.find((e) => e.employeeId === printModalTargetEmpId);
 
         const currentPrintUrl =
           printModalType === 'paystub'
@@ -2601,6 +3420,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                           const targetRecords =
                             printModalTargetWeek === currentWeekFriday ? activeWorkingRecords : historicalRecords;
                           const grpEmps = employees.filter((e) => {
+                            if (!e.active) return false;
                             if (getEmpGroup(e).id !== grp.id) return false;
                             return targetRecords.some(
                               (r) =>
@@ -2635,13 +3455,13 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:outline-hidden focus:border-emerald-500 font-mono"
                       >
                         <option value={currentWeekFriday}>
-                          {currentWeekFriday} (이번 주 — {formatWorkWeekRange(currentWeekFriday, 'ko')})
+                          {currentWeekFriday} ({language === 'ko' ? '이번 주' : 'Current Week'} — {formatWorkWeekRange(currentWeekFriday, language)})
                         </option>
                         {allRecordedPeriods
                           .filter((p) => p.weekStartDate !== currentWeekFriday)
                           .map((p) => (
                             <option key={p.id} value={p.weekStartDate}>
-                              {p.weekStartDate} (과거 주차 — {formatWorkWeekRange(p.weekStartDate, 'ko')})
+                              {p.weekStartDate} ({language === 'ko' ? '과거 주차' : 'Past Week'} — {formatWorkWeekRange(p.weekStartDate, language)})
                             </option>
                           ))}
                       </select>
@@ -2692,13 +3512,13 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-xs font-bold text-slate-800 focus:outline-hidden focus:border-emerald-500 font-mono"
                       >
                         <option value={currentWeekFriday}>
-                          {currentWeekFriday} (이번 주 — {formatWorkWeekRange(currentWeekFriday, 'ko')})
+                          {currentWeekFriday} ({language === 'ko' ? '이번 주' : 'Current Week'} — {formatWorkWeekRange(currentWeekFriday, language)})
                         </option>
                         {allRecordedPeriods
                           .filter((p) => p.weekStartDate !== currentWeekFriday)
                           .map((p) => (
                             <option key={p.id} value={p.weekStartDate}>
-                              {p.weekStartDate} (과거 주차 — {formatWorkWeekRange(p.weekStartDate, 'ko')})
+                              {p.weekStartDate} ({language === 'ko' ? '과거 주차' : 'Past Week'} — {formatWorkWeekRange(p.weekStartDate, language)})
                             </option>
                           ))}
                       </select>
@@ -2726,15 +3546,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   </div>
                   {printModalType === 'paystub' ? (
                     <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-slate-600">
-                      <div>직원: <strong className="text-slate-900">{modalEmp?.fullName || printModalTargetEmpId}</strong></div>
-                      <div>지급일: <strong className="text-slate-900">{printModalTargetWeek}</strong></div>
-                      <div>총지급액: <strong className="text-slate-900">{modalRec ? formatCurrency(modalRec.grossPay) : '-'}</strong></div>
-                      <div>실지급액: <strong className="text-emerald-700 font-bold">{modalRec ? formatCurrency(modalRec.netPay) : '-'}</strong></div>
+                      <div>{language === 'ko' ? '직원:' : 'Staff:'} <strong className="text-slate-900">{modalEmp?.fullName || printModalTargetEmpId}</strong></div>
+                      <div>{language === 'ko' ? '지급일:' : 'Pay Date:'} <strong className="text-slate-900">{printModalTargetWeek}</strong></div>
+                      <div>{language === 'ko' ? '총지급액:' : 'Gross Pay:'} <strong className="text-slate-900">{modalRec ? formatCurrency(modalRec.grossPay) : '-'}</strong></div>
+                      <div>{language === 'ko' ? '실지급액:' : 'Net Pay:'} <strong className="text-emerald-700 font-bold">{modalRec ? formatCurrency(modalRec.netPay) : '-'}</strong></div>
                     </div>
                   ) : (
                     <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-slate-600">
-                      <div>사업장: <strong className="text-slate-900">{printModalTargetGroup === 'ALL' ? '전체 5개 사업장' : BUSINESS_GROUPS.find(g => g.id === printModalTargetGroup)?.name}</strong></div>
-                      <div>지급일: <strong className="text-slate-900">{printModalTargetWeek}</strong></div>
+                      <div>{language === 'ko' ? '사업장:' : 'Branch:'} <strong className="text-slate-900">{printModalTargetGroup === 'ALL' ? (language === 'ko' ? '전체 5개 사업장' : 'All 5 Branches') : BUSINESS_GROUPS.find(g => g.id === printModalTargetGroup)?.name}</strong></div>
+                      <div>{language === 'ko' ? '지급일:' : 'Pay Date:'} <strong className="text-slate-900">{printModalTargetWeek}</strong></div>
                     </div>
                   )}
                 </div>
@@ -2771,7 +3591,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     }
                   }}
                   className="w-full sm:w-auto px-3.5 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 text-xs font-bold shadow-xs flex items-center justify-center space-x-1.5 transition-colors cursor-pointer"
-                  title="오프라인 보관용 HTML 파일 다운로드"
+                  title={language === 'ko' ? '오프라인 보관용 HTML 파일 다운로드' : 'Download offline HTML file'}
                 >
                   <Download className="w-3.5 h-3.5 text-slate-500" />
                   <span>{language === 'ko' ? '인쇄용 HTML 파일 다운로드' : 'Download HTML'}</span>
@@ -2792,7 +3612,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     target="_blank"
                     rel="noopener noreferrer"
                     className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
-                    title="새 창에서 열어 바로 인쇄"
+                    title={language === 'ko' ? '새 창에서 열어 바로 인쇄' : 'Open and print in a new tab'}
                   >
                     <Printer className="w-4 h-4" />
                     <span>{language === 'ko' ? '새 창에서 열어 바로 인쇄하기 (추천)' : 'Print Now (New Tab)'}</span>
@@ -2810,7 +3630,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       }
                     }}
                     className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
-                    title="현재 화면에서 인쇄 시도"
+                    title={language === 'ko' ? '현재 화면에서 인쇄 시도' : 'Try printing in current frame'}
                   >
                     <span>{language === 'ko' ? '직접 호출' : 'Call Dialog'}</span>
                   </button>
@@ -2835,7 +3655,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     {language === 'ko' ? '급여명세서 세금공제 직접 입력' : 'Direct Paystub Tax Deduction'}
                   </h3>
                   <p className="text-xs text-slate-500">
-                    {taxTargetRecord.employeeName} ({taxTargetRecord.employeeId}) • 총 급여: {formatCurrency(taxTargetRecord.grossPay)}
+                    {taxTargetRecord.employeeName} ({taxTargetRecord.employeeId}) • {language === 'ko' ? '총 급여:' : 'Gross:'} {formatCurrency(taxTargetRecord.grossPay)}
                   </p>
                 </div>
               </div>
@@ -2897,7 +3717,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               <div className="space-y-3">
                 <div>
                   <label className="text-xs font-bold text-slate-700 block mb-1">
-                    Federal Withholding (FIT / 연방세) ($)
+                    {language === 'ko' ? 'Federal Withholding (FIT / 연방세) ($)' : 'Federal Withholding (FIT) ($)'}
                   </label>
                   <div className="relative">
                     <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xs">$</span>
@@ -2919,7 +3739,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
                 <div>
                   <label className="text-xs font-bold text-slate-700 block mb-1">
-                    Virginia State Income Tax (SIT / 주세) ($)
+                    {language === 'ko' ? 'Virginia State Income Tax (SIT / 주세) ($)' : 'Virginia State Income Tax (SIT) ($)'}
                   </label>
                   <div className="relative">
                     <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xs">$</span>
@@ -2999,11 +3819,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                 return (
                   <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-1.5 text-xs font-mono">
                     <div className="flex justify-between text-slate-600">
-                      <span>총 공제 세금 (Total Taxes):</span>
+                      <span>{language === 'ko' ? '총 공제 세금 (Total Taxes):' : 'Total Taxes:'}</span>
                       <span className="font-bold text-rose-700">-{formatCurrency(totDed)}</span>
                     </div>
                     <div className="flex justify-between text-slate-900 font-extrabold text-sm border-t border-slate-200 pt-1.5">
-                      <span>실 지급액 (Net Pay):</span>
+                      <span>{language === 'ko' ? '실 지급액 (Net Pay):' : 'Net Pay:'}</span>
                       <span className="text-emerald-700">{formatCurrency(net)}</span>
                     </div>
                   </div>

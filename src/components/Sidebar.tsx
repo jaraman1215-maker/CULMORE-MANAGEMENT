@@ -12,6 +12,7 @@ import {
   Sparkles,
   Store,
   ShieldAlert,
+  Lock,
 } from 'lucide-react';
 import { useLanguage } from '../context/LanguageContext';
 import { useAuth } from '../context/AuthContext';
@@ -24,6 +25,7 @@ interface SidebarProps {
   mobileOpen: boolean;
   setMobileOpen: (open: boolean) => void;
   onOpenTestModal: () => void;
+  onLockWorkspace?: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -32,6 +34,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   mobileOpen,
   setMobileOpen,
   onOpenTestModal,
+  onLockWorkspace,
 }) => {
   const { language, toggleLanguage, t } = useLanguage();
   const { currentUser, adminProfile, isDemoMode, toggleDemoMode, signOutUser } = useAuth();
@@ -85,15 +88,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 isDemoMode ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'
               }`}
             />
-            <span className="text-xs font-semibold text-slate-300">
-              {isDemoMode ? 'Demo Mode (25 Sample Staff)' : 'Live Cloud Firestore'}
+            <span className="text-xs font-semibold text-slate-300 truncate max-w-44">
+              {isDemoMode ? t('localDemoOnly') : t('cloudSyncActive')}
             </span>
           </div>
           <button
             onClick={() => toggleDemoMode()}
-            className="text-[11px] text-emerald-400 hover:text-emerald-300 font-medium hover:underline flex items-center space-x-1"
+            className="text-[11px] text-emerald-400 hover:text-emerald-300 font-medium hover:underline flex items-center space-x-1 shrink-0"
           >
-            <span>{isDemoMode ? 'Go Live' : 'Demo'}</span>
+            <span>{isDemoMode ? (language === 'ko' ? '실시간 전환' : 'Go Live') : 'Demo'}</span>
           </button>
         </div>
 
@@ -147,7 +150,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             <div className="flex items-center space-x-2">
               <Globe className="w-3.5 h-3.5 text-slate-400" />
-              <span>Language / 언어</span>
+              <span>{language === 'en' ? 'Language' : '언어 / Language'}</span>
             </div>
             <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-bold text-xs uppercase">
               {language === 'en' ? 'English' : '한국어'}
@@ -158,30 +161,46 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="flex items-center justify-between pt-1">
             <div className="flex items-center space-x-2.5 overflow-hidden">
               <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold text-white shrink-0">
-                {currentUser?.email ? currentUser.email.charAt(0).toUpperCase() : 'A'}
+                {(adminProfile?.loginId || currentUser?.email || adminProfile?.name || 'A').charAt(0).toUpperCase()}
               </div>
               <div className="overflow-hidden">
                 <p className="text-xs font-semibold text-white truncate">
-                  {currentUser?.displayName || (isDemoMode ? 'Demo Store Admin' : 'Admin User')}
+                  {adminProfile?.name || currentUser?.displayName || (isDemoMode ? 'Demo Store Admin' : 'Admin User')}
                 </p>
                 <div className="flex items-center space-x-1">
                   <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
                   <span className="text-[10px] text-slate-400 truncate">
-                    {adminProfile?.role === 'super_admin' ? t('superAdminBadge') : t('adminBadge')}
+                    {adminProfile?.role === 'super_admin'
+                      ? t('superAdminBadge')
+                      : adminProfile?.role === 'manager'
+                      ? t('managerBadge')
+                      : t('adminBadge')}
+                    {adminProfile?.loginId ? ` · ${adminProfile.loginId}` : ''}
                   </span>
                 </div>
               </div>
             </div>
 
-            {currentUser && (
-              <button
-                onClick={() => signOutUser()}
-                title={t('signOut')}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition-colors"
-              >
-                <LogOut className="w-4 h-4" />
-              </button>
-            )}
+            <div className="flex items-center space-x-1">
+              {onLockWorkspace && (
+                <button
+                  onClick={onLockWorkspace}
+                  title={language === 'ko' ? '작업화면 잠금' : 'Lock Workspace'}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-amber-400 hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  <Lock className="w-4 h-4" />
+                </button>
+              )}
+              {currentUser && (
+                <button
+                  onClick={() => signOutUser()}
+                  title={t('signOut')}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  <LogOut className="w-4 h-4" />
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </aside>

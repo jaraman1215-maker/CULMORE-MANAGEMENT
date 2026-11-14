@@ -1,28 +1,34 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Settings,
   Shield,
   History,
   Store,
   DollarSign,
-  UserCheck,
   Save,
   CheckCircle2,
-  AlertCircle,
-  Clock,
-  Mail,
   UserPlus,
+  Trash2,
+  Lock,
+  Eye,
+  EyeOff,
+  KeyRound,
 } from 'lucide-react';
 import { useLanguage } from '../context/LanguageContext';
-import { StoreSettings, AuditLog, Administrator, BUSINESS_GROUPS, GroupStoreInfo } from '../types';
+import { StoreSettings, AuditLog, Administrator, AdminRole, BUSINESS_GROUPS, GroupStoreInfo } from '../types';
 import { useAuth } from '../context/AuthContext';
+import { PasswordResetInitialTarget } from './PasswordResetModal';
 
 interface SettingsAndAuditViewProps {
   settings: StoreSettings;
   auditLogs: AuditLog[];
   administrators: Administrator[];
   onSaveSettings: (settings: StoreSettings) => Promise<void>;
-  onProvisionAdmin: (email: string, role: 'admin' | 'manager', name: string) => Promise<void>;
+  onUpdatePasscode?: (newPasscode: string) => Promise<void>;
+  onProvisionAdmin: (emailOrId: string, role: AdminRole, name: string) => Promise<void>;
+  onUpdateAdminRole: (uid: string, role: AdminRole) => Promise<void>;
+  onDeleteAdmin: (uid: string) => Promise<void>;
+  onOpenPasswordReset?: (target?: PasswordResetInitialTarget) => void;
 }
 
 export const SettingsAndAuditView: React.FC<SettingsAndAuditViewProps> = ({
@@ -30,10 +36,15 @@ export const SettingsAndAuditView: React.FC<SettingsAndAuditViewProps> = ({
   auditLogs,
   administrators,
   onSaveSettings,
+  onUpdatePasscode,
   onProvisionAdmin,
+  onUpdateAdminRole,
+  onDeleteAdmin,
+  onOpenPasswordReset,
 }) => {
   const { t, language } = useLanguage();
-  const { isSuperAdmin } = useAuth();
+  const { isSuperAdmin, currentUser } = useAuth();
+  const isJaramanOwner = (currentUser?.email || '').toLowerCase() === 'jaraman1215@gmail.com';
 
   const [activeTab, setActiveTab] = useState<'settings' | 'audit' | 'admins'>('settings');
   const [formData, setFormData] = useState<StoreSettings>({ ...settings });
@@ -41,11 +52,23 @@ export const SettingsAndAuditView: React.FC<SettingsAndAuditViewProps> = ({
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
+  // 6-digit workspace passcode state (jaraman1215@gmail.com only)
+  const [passcodeInput, setPasscodeInput] = useState<string>(settings.workspacePasscode || '123456');
+  const [showPasscode, setShowPasscode] = useState(false);
+  const [isSavingPasscode, setIsSavingPasscode] = useState(false);
+  const [passcodeMessage, setPasscodeMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  useEffect(() => {
+    setFormData({ ...settings });
+    setPasscodeInput(settings.workspacePasscode || '123456');
+  }, [settings]);
+
   // Invite admin form
   const [newAdminEmail, setNewAdminEmail] = useState('');
   const [newAdminName, setNewAdminName] = useState('');
-  const [newAdminRole, setNewAdminRole] = useState<'admin' | 'manager'>('admin');
+  const [newAdminRole, setNewAdminRole] = useState<AdminRole>('admin');
   const [adminSuccess, setAdminSuccess] = useState(false);
+  const [confirmDeleteUid, setConfirmDeleteUid] = useState<string | null>(null);
 
   const currentGroupInfo: GroupStoreInfo = selectedGroupSetting === 'HQ'
     ? {
@@ -262,7 +285,7 @@ export const SettingsAndAuditView: React.FC<SettingsAndAuditViewProps> = ({
                   type="text"
                   value={currentGroupInfo.storeNameKo || ''}
                   onChange={(e) => handleGroupInfoChange('storeNameKo', e.target.value)}
-                  placeholder="예: 쿨모어 슈퍼마켓"
+                  placeholder={language === 'ko' ? '예: 쿨모어 슈퍼마켓' : 'e.g. Culmore Supermarket (Korean)'}
                   className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white font-bold text-slate-900 focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
                 />
               </div>
@@ -463,6 +486,140 @@ export const SettingsAndAuditView: React.FC<SettingsAndAuditViewProps> = ({
         </form>
       )}
 
+      {/* 6-Digit Workspace Security Passcode Panel (jaraman1215@gmail.com only) */}
+      {activeTab === 'settings' && (
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4 text-xs max-w-4xl">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="flex items-center space-x-2">
+              <div className="w-8 h-8 rounded-xl bg-slate-900 text-emerald-400 flex items-center justify-center">
+                <Lock className="w-4 h-4" />
+              </div>
+              <div>
+                <h2 className="text-sm font-bold text-slate-900">
+                  {language === 'ko' ? '작업화면 진입 보안 비밀번호 (6자리 숫자)' : 'Workspace Launch Passcode (6-Digit PIN)'}
+                </h2>
+                <p className="text-[11px] text-slate-500">
+                  {language === 'ko'
+                    ? '프로그램 실행 시 작업화면 진입 전에 6자리 비밀번호를 확인합니다. 최고 관리자(jaraman1215@gmail.com)만 확인 및 수정할 수 있습니다.'
+                    : 'Requires a 6-digit PIN upon launching the workspace. Strictly viewable and editable only by jaraman1215@gmail.com.'}
+                </p>
+              </div>
+            </div>
+            <span className="px-2.5 py-1 rounded-lg bg-slate-100 text-slate-700 font-mono font-bold text-[11px] self-start sm:self-auto">
+              Owner: jaraman1215@gmail.com
+            </span>
+          </div>
+
+          {passcodeMessage && (
+            <div
+              className={`p-3 rounded-xl font-bold flex items-center space-x-2 border ${
+                passcodeMessage.type === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-rose-50 border-rose-200 text-rose-700'
+              }`}
+            >
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              <span>{passcodeMessage.text}</span>
+            </div>
+          )}
+
+          {isJaramanOwner ? (
+            <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 flex flex-col sm:flex-row sm:items-end gap-3">
+              <div className="flex-1 max-w-xs">
+                <label className="font-bold text-slate-700 block mb-1">
+                  {language === 'ko' ? '새 6자리 비밀번호 (숫자 6자리)' : '6-Digit Numeric Passcode'}
+                </label>
+                <div className="relative">
+                  <input
+                    type={showPasscode ? 'text' : 'password'}
+                    inputMode="numeric"
+                    maxLength={6}
+                    value={passcodeInput}
+                    onChange={(e) => {
+                      setPasscodeInput(e.target.value.replace(/\D/g, '').slice(0, 6));
+                      setPasscodeMessage(null);
+                    }}
+                    placeholder="123456"
+                    className="w-full px-3 py-2 pr-10 rounded-xl border border-slate-300 bg-white font-mono font-black tracking-[0.35em] text-sm text-slate-900 focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPasscode((prev) => !prev)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 cursor-pointer"
+                  >
+                    {showPasscode ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                disabled={isSavingPasscode}
+                onClick={async () => {
+                  if (!/^\d{6}$/.test(passcodeInput)) {
+                    setPasscodeMessage({
+                      type: 'error',
+                      text:
+                        language === 'ko'
+                          ? '비밀번호는 반드시 숫자 6자리여야 합니다.'
+                          : 'Passcode must be exactly 6 numeric digits.',
+                    });
+                    return;
+                  }
+                  if (!onUpdatePasscode) return;
+                  try {
+                    setIsSavingPasscode(true);
+                    await onUpdatePasscode(passcodeInput);
+                    setPasscodeMessage({
+                      type: 'success',
+                      text:
+                        language === 'ko'
+                          ? '6자리 보안 비밀번호가 저장되었습니다. 모든 기기에 즉시 동기화됩니다.'
+                          : '6-digit workspace passcode updated and synced across devices.',
+                    });
+                  } catch (err) {
+                    setPasscodeMessage({
+                      type: 'error',
+                      text: err instanceof Error ? err.message : 'Failed to update passcode.',
+                    });
+                  } finally {
+                    setIsSavingPasscode(false);
+                  }
+                }}
+                className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-xs flex items-center space-x-2 transition-colors cursor-pointer"
+              >
+                <Save className="w-4 h-4 text-emerald-400" />
+                <span>
+                  {isSavingPasscode
+                    ? language === 'ko'
+                      ? '저장 중...'
+                      : 'Saving...'
+                    : language === 'ko'
+                    ? '6자리 비밀번호 변경 저장'
+                    : 'Save 6-Digit Passcode'}
+                </span>
+              </button>
+            </div>
+          ) : (
+            <div className="p-4 rounded-xl bg-amber-50/70 border border-amber-200 flex items-center justify-between gap-3">
+              <div className="space-y-0.5">
+                <p className="font-bold text-amber-900">
+                  {language === 'ko' ? '비밀번호 수정 권한 제한됨' : 'Restricted Security Setting'}
+                </p>
+                <p className="text-[11px] text-amber-800">
+                  {language === 'ko'
+                    ? '6자리 작업화면 비밀번호는 jaraman1215@gmail.com 계정으로 로그인한 관리자만 확인 및 수정할 수 있습니다.'
+                    : 'Only the primary administrator signed in as jaraman1215@gmail.com can view or modify this 6-digit passcode.'}
+                </p>
+              </div>
+              <span className="px-3 py-1.5 rounded-lg bg-white border border-amber-200 font-mono font-bold text-slate-500 tracking-widest shrink-0">
+                ••••••
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* TAB 2: AUDIT LOG */}
       {activeTab === 'audit' && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
@@ -545,19 +702,19 @@ export const SettingsAndAuditView: React.FC<SettingsAndAuditViewProps> = ({
 
             <form onSubmit={handleCreateAdmin} className="grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs">
               <div>
-                <label className="font-bold text-slate-700 block mb-1">Admin Email *</label>
+                <label className="font-bold text-slate-700 block mb-1">{t('loginIdLabel')} *</label>
                 <input
-                  type="email"
+                  type="text"
                   required
                   value={newAdminEmail}
                   onChange={(e) => setNewAdminEmail(e.target.value)}
-                  placeholder="manager@hanaromarket.com"
+                  placeholder={t('loginIdPlaceholder')}
                   className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-slate-900"
                 />
               </div>
 
               <div>
-                <label className="font-bold text-slate-700 block mb-1">Full Name</label>
+                <label className="font-bold text-slate-700 block mb-1">{t('adminNameLabel')}</label>
                 <input
                   type="text"
                   value={newAdminName}
@@ -568,14 +725,15 @@ export const SettingsAndAuditView: React.FC<SettingsAndAuditViewProps> = ({
               </div>
 
               <div>
-                <label className="font-bold text-slate-700 block mb-1">Access Role</label>
+                <label className="font-bold text-slate-700 block mb-1">{t('adminRoleLabel')}</label>
                 <select
                   value={newAdminRole}
-                  onChange={(e) => setNewAdminRole(e.target.value as 'admin' | 'manager')}
+                  onChange={(e) => setNewAdminRole(e.target.value as AdminRole)}
                   className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-slate-900 font-bold"
                 >
-                  <option value="admin">Store Admin (Full Control)</option>
-                  <option value="manager">Shift Manager (Schedules only)</option>
+                  {isSuperAdmin && <option value="super_admin">{t('superAdminBadge')}</option>}
+                  <option value="admin">{t('adminBadge')}</option>
+                  <option value="manager">{t('managerBadge')}</option>
                 </select>
               </div>
 
@@ -584,7 +742,7 @@ export const SettingsAndAuditView: React.FC<SettingsAndAuditViewProps> = ({
                   type="submit"
                   className="w-full px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow-xs transition-colors"
                 >
-                  Provision Admin
+                  {language === 'ko' ? '관리자 사전 등록' : 'Provision Admin'}
                 </button>
               </div>
             </form>
@@ -593,34 +751,116 @@ export const SettingsAndAuditView: React.FC<SettingsAndAuditViewProps> = ({
           {/* List of Authorized Administrators */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
             <div className="p-4 border-b border-slate-100 font-bold text-slate-900 text-sm">
-              Current Authorized Administrators
+              {language === 'ko' ? '등록된 관리자 목록' : 'Current Authorized Administrators'}
             </div>
             <div className="divide-y divide-slate-100 text-xs">
-              {administrators.map((admin) => (
-                <div key={admin.uid || admin.email} className="p-4 flex items-center justify-between hover:bg-slate-50">
-                  <div className="flex items-center space-x-3">
-                    <div className="w-9 h-9 rounded-full bg-slate-800 text-white flex items-center justify-center font-bold text-xs">
-                      {admin.name ? admin.name.charAt(0) : 'A'}
+              {administrators.map((admin) => {
+                const isSelf = currentUser?.uid === admin.uid;
+                return (
+                  <div key={admin.uid || admin.email} className="p-4 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-50">
+                    <div className="flex items-center space-x-3">
+                      <div className="w-9 h-9 rounded-full bg-slate-800 text-white flex items-center justify-center font-bold text-xs">
+                        {admin.name ? admin.name.charAt(0).toUpperCase() : 'A'}
+                      </div>
+                      <div>
+                        <p className="font-bold text-slate-900">
+                          {admin.name || 'Store Admin'}
+                          {isSelf && (
+                            <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-700 font-bold">
+                              {language === 'ko' ? '내 계정' : 'You'}
+                            </span>
+                          )}
+                        </p>
+                        <p className="text-slate-500 font-mono text-[11px]">
+                          {admin.loginId ? `ID: ${admin.loginId}` : admin.email}
+                        </p>
+                      </div>
                     </div>
-                    <div>
-                      <p className="font-bold text-slate-900">{admin.name || 'Store Admin'}</p>
-                      <p className="text-slate-500 font-mono text-[11px]">{admin.email}</p>
+
+                    <div className="flex items-center space-x-2">
+                      {isSuperAdmin && !isSelf ? (
+                        <select
+                          value={admin.role}
+                          onChange={(e) => onUpdateAdminRole(admin.uid, e.target.value as AdminRole)}
+                          className={`px-2.5 py-1 rounded-lg font-bold text-[11px] uppercase border cursor-pointer ${
+                            admin.role === 'super_admin'
+                              ? 'bg-purple-50 text-purple-800 border-purple-200'
+                              : admin.role === 'admin'
+                              ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                              : 'bg-blue-50 text-blue-800 border-blue-200'
+                          }`}
+                        >
+                          <option value="super_admin">{t('superAdminBadge')}</option>
+                          <option value="admin">{t('adminBadge')}</option>
+                          <option value="manager">{t('managerBadge')}</option>
+                        </select>
+                      ) : (
+                        <span
+                          className={`px-2.5 py-1 rounded-full font-bold text-[10px] uppercase tracking-wider ${
+                            admin.role === 'super_admin'
+                              ? 'bg-purple-100 text-purple-800 border border-purple-200'
+                              : admin.role === 'admin'
+                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                              : 'bg-blue-100 text-blue-800 border border-blue-200'
+                          }`}
+                        >
+                          {admin.role.replace('_', ' ')}
+                        </span>
+                      )}
+
+                      {onOpenPasswordReset && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onOpenPasswordReset({
+                              type: 'admin',
+                              idOrEmail: admin.uid || admin.email,
+                            })
+                          }
+                          title={language === 'ko' ? '임시 인증 코드로 비밀번호 재설정' : 'Reset password via temporary verification code'}
+                          className="px-2.5 py-1 rounded-lg border border-amber-200 bg-amber-50 hover:bg-amber-100 text-amber-800 font-bold text-[11px] flex items-center space-x-1 transition-colors cursor-pointer"
+                        >
+                          <KeyRound className="w-3 h-3" />
+                          <span>{language === 'ko' ? '비밀번호 재설정' : 'Reset PW'}</span>
+                        </button>
+                      )}
+
+                      {isSuperAdmin && !isSelf && (
+                        confirmDeleteUid === admin.uid ? (
+                          <div className="flex items-center space-x-1">
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                await onDeleteAdmin(admin.uid);
+                                setConfirmDeleteUid(null);
+                              }}
+                              className="px-2 py-1 rounded-lg bg-rose-600 text-white font-bold text-[10px]"
+                            >
+                              {language === 'ko' ? '확인' : 'Confirm'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteUid(null)}
+                              className="px-2 py-1 rounded-lg bg-slate-200 text-slate-700 font-bold text-[10px]"
+                            >
+                              {t('cancel')}
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteUid(admin.uid)}
+                            title={language === 'ko' ? '관리자 삭제' : 'Remove Admin'}
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )
+                      )}
                     </div>
                   </div>
-
-                  <span
-                    className={`px-2.5 py-1 rounded-full font-bold text-[10px] uppercase tracking-wider ${
-                      admin.role === 'super_admin'
-                        ? 'bg-purple-100 text-purple-800 border border-purple-200'
-                        : admin.role === 'admin'
-                        ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                        : 'bg-blue-100 text-blue-800 border border-blue-200'
-                    }`}
-                  >
-                    {admin.role.replace('_', ' ')}
-                  </span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </div>

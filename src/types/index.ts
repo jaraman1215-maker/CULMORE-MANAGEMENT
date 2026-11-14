@@ -5,6 +5,7 @@ export type AdminRole = 'super_admin' | 'admin' | 'manager';
 export interface Administrator {
   uid: string;
   email: string;
+  loginId?: string;
   name: string;
   role: AdminRole;
   createdAt: string;
@@ -120,13 +121,13 @@ export function getBusinessGroup(groupVal?: string | number): BusinessGroup {
     const found = BUSINESS_GROUPS.find((g) => g.groupNumber === groupVal);
     if (found) return found;
   }
-  const str = String(groupVal).toUpperCase();
-  if (str.includes('1') || str.includes('DRUG')) return BUSINESS_GROUPS[0];
-  if (str.includes('2') || str.includes('SUPERMARKET') || str.includes('CULMORE')) return BUSINESS_GROUPS[1];
-  if (str.includes('3') || str.includes('FALLS')) return BUSINESS_GROUPS[2];
-  if (str.includes('4') || str.includes('ANANDALE') || str.includes('ANNANDALE')) return BUSINESS_GROUPS[3];
-  if (str.includes('5') || str.includes('SSAM') || str.includes('KITCHEN')) return BUSINESS_GROUPS[4];
-  const exact = BUSINESS_GROUPS.find((g) => g.name === groupVal || g.id === groupVal);
+  const str = String(groupVal).trim().toUpperCase();
+  if (str === 'GROUP_1' || str === 'GROUP 1' || str === '1' || str.includes('CMORE') || str.includes('DRUG')) return BUSINESS_GROUPS[0];
+  if (str === 'GROUP_2' || str === 'GROUP 2' || str === '2' || str.includes('CULMORE') || str.includes('SUPERMARKET')) return BUSINESS_GROUPS[1];
+  if (str === 'GROUP_3' || str === 'GROUP 3' || str === '3' || str.includes('FALLS')) return BUSINESS_GROUPS[2];
+  if (str === 'GROUP_4' || str === 'GROUP 4' || str === '4' || str.includes('ANANDALE') || str.includes('ANNANDALE')) return BUSINESS_GROUPS[3];
+  if (str === 'GROUP_5' || str === 'GROUP 5' || str === '5' || str.includes('SSAM') || str.includes('KITCHEN')) return BUSINESS_GROUPS[4];
+  const exact = BUSINESS_GROUPS.find((g) => g.name.toUpperCase() === str || g.id.toUpperCase() === str);
   return exact || BUSINESS_GROUPS[1];
 }
 
@@ -135,6 +136,7 @@ export interface Employee {
   employeeId: string; // e.g. EMP-101
   fullName: string;
   fullNameKo?: string;
+  nickname?: string;
   position: string;
   department: GroceryDepartment;
   businessGroup?: BusinessGroupName; // Group 1 to 5
@@ -162,6 +164,7 @@ export interface Shift {
   scheduleId: string; // YYYY-MM-DD representing Friday start
   employeeId: string;
   employeeName: string;
+  position?: string; // Direct position per shift (e.g. Cashier, Meat Cutter, Kitchen Prep)
   date: string; // YYYY-MM-DD
   dayOfWeek: string; // 'Friday' | 'Saturday' | ...
   startTime: string; // 'HH:MM' 24h format
@@ -307,6 +310,7 @@ export interface StoreSettings {
   overtimeMultiplier: number; // 1.5
   defaultBreakMinutes: number; // 30
   workWeekStartDay: string; // 'Friday'
+  workspacePasscode?: string; // 6-digit workspace entry passcode (editable only by jaraman1215@gmail.com)
   groupSettings?: Record<string, GroupStoreInfo>; // Per-group store information
   updatedAt?: string;
   updatedBy?: string;
@@ -356,3 +360,48 @@ export interface AuditLog {
   performedByEmail: string;
   timestamp: string;
 }
+
+export interface ScheduleBackupFile {
+  type: 'CULMORE_SCHEDULE_BACKUP';
+  version: number;
+  id: string;
+  weekStartDate: string;
+  exportedAt: string;
+  reason: 'auto' | 'manual';
+  shiftCount: number;
+  shifts: Shift[];
+}
+
+export interface FinalPayrollArchive {
+  type: 'CULMORE_FINAL_PAYROLL_ARCHIVE';
+  version: number;
+  id: string;
+  savedAt: string;
+  finalizedBy: string;
+  period: PayrollPeriod;
+  records: PayrollRecord[];
+  employees: Employee[];
+  settings: StoreSettings;
+}
+
+export type PasswordResetTargetType = 'employee' | 'admin';
+
+export type PasswordResetStatus = 'pending' | 'verified' | 'completed' | 'expired' | 'revoked';
+
+export interface PasswordResetRequest {
+  id: string;
+  targetType: PasswordResetTargetType;
+  targetUid?: string;
+  targetName: string;
+  email: string;
+  loginId?: string;
+  codeHash: string;
+  firebaseEmailSent: boolean;
+  status: PasswordResetStatus;
+  expiresAt: string;
+  createdAt: string;
+  requestedBy: string;
+  verifiedAt?: string;
+  completedAt?: string;
+}
+

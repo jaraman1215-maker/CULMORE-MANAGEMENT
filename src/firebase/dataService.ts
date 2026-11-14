@@ -24,7 +24,8 @@ import {
   PayrollAdjustment,
   PaymentMethod,
 } from '../types';
-import { INITIAL_STORE_SETTINGS, SAMPLE_EMPLOYEES, generateSampleShiftsForWeek } from '../utils/demoData';
+import { AdminRole } from '../types';
+import { INITIAL_STORE_SETTINGS, SAMPLE_EMPLOYEES } from '../utils/demoData';
 import { getWorkWeekFriday, getDaysInWorkWeek } from '../utils/dateUtils';
 import { calculatePayroll, calculateWeeklyHoursSummary } from '../utils/calculations';
 
@@ -35,6 +36,7 @@ const DEMO_PAYROLL_PERIODS_KEY = 'hanaro_demo_payroll_periods';
 const DEMO_PAYROLL_RECORDS_KEY = 'hanaro_demo_payroll_records';
 const DEMO_SETTINGS_KEY = 'hanaro_demo_settings';
 const DEMO_AUDIT_KEY = 'hanaro_demo_audit';
+const DEMO_ADMINS_KEY = 'hanaro_demo_admins';
 
 // Helper to log audit actions
 export async function logAudit(
@@ -76,11 +78,16 @@ export async function logAudit(
 export async function fetchEmployees(isDemo: boolean): Promise<Employee[]> {
   if (isDemo) {
     const saved = localStorage.getItem(DEMO_EMPLOYEES_KEY);
-    if (saved) {
-      return JSON.parse(saved);
+    if (saved !== null) {
+      try {
+        return JSON.parse(saved);
+      } catch {
+        return [];
+      }
     }
-    localStorage.setItem(DEMO_EMPLOYEES_KEY, JSON.stringify(SAMPLE_EMPLOYEES));
-    return SAMPLE_EMPLOYEES;
+    // Default to empty array so users can start fresh or click 'Seed'
+    localStorage.setItem(DEMO_EMPLOYEES_KEY, JSON.stringify([]));
+    return [];
   }
 
   try {
@@ -111,12 +118,15 @@ export async function saveEmployeeRecord(isDemo: boolean, employee: Employee): P
   }
 
   const docId = employee.id || `emp_${employee.employeeId}`;
-  const payload: Employee = {
+  const rawPayload: Employee = {
     ...employee,
     id: docId,
     updatedAt: new Date().toISOString(),
     createdAt: employee.createdAt || new Date().toISOString(),
   };
+  const payload = Object.fromEntries(
+    Object.entries(rawPayload).filter(([, v]) => v !== undefined)
+  );
 
   try {
     await setDoc(doc(db, 'employees', docId), payload);
@@ -129,8 +139,20 @@ export async function saveEmployeeRecord(isDemo: boolean, employee: Employee): P
 export async function archiveEmployeeRecord(isDemo: boolean, employeeId: string, active: boolean): Promise<void> {
   if (isDemo) {
     const list = await fetchEmployees(true);
+    const target = list.find(e => e.id === employeeId || e.employeeId === employeeId);
+    const targetEmpId = target?.employeeId || employeeId;
     const updated = list.map(e => e.id === employeeId || e.employeeId === employeeId ? { ...e, active } : e);
     localStorage.setItem(DEMO_EMPLOYEES_KEY, JSON.stringify(updated));
+
+    // If deactivated, purge from open (non-finalized) payroll records
+    if (!active) {
+      const payRecs: PayrollRecord[] = JSON.parse(localStorage.getItem(DEMO_PAYROLL_RECORDS_KEY) || '[]');
+      const periods: PayrollPeriod[] = JSON.parse(localStorage.getItem(DEMO_PAYROLL_PERIODS_KEY) || '[]');
+      const openPeriodIds = new Set(periods.filter(p => p.status !== 'finalized').map(p => p.id));
+      const filtered = payRecs.filter(r => !(openPeriodIds.has(r.periodId) && (r.employeeId === targetEmpId || r.employeeId === employeeId)));
+      localStorage.setItem(DEMO_PAYROLL_RECORDS_KEY, JSON.stringify(filtered));
+    }
+
     await logAudit(true, active ? 'REACTIVATE_EMPLOYEE' : 'ARCHIVE_EMPLOYEE', 'EMPLOYEE', employeeId, `Toggled active status to ${active}`);
     return;
   }
@@ -138,9 +160,113 @@ export async function archiveEmployeeRecord(isDemo: boolean, employeeId: string,
   try {
     const ref = doc(db, 'employees', employeeId);
     await updateDoc(ref, { active, updatedAt: new Date().toISOString() });
+
+    // If deactivated, purge from open payroll records in Firestore
+    if (!active) {
+      const empSnap = await getDoc(ref);
+      const targetEmpId = empSnap.exists() ? (empSnap.data() as Employee).employeeId : employeeId;
+      const openPeriodsSnap = await getDocs(query(collection(db, 'payrollPeriods'), where('status', '!=', 'finalized')));
+      for (const pDoc of openPeriodsSnap.docs) {
+        const recSnap = await getDocs(
+          query(collection(db, 'payrollRecords'), where('periodId', '==', pDoc.id), where('employeeId', '==', targetEmpId))
+        );
+        for (const r of recSnap.docs) {
+          await deleteDoc(r.ref);
+        }
+      }
+    }
+
     await logAudit(false, active ? 'REACTIVATE_EMPLOYEE' : 'ARCHIVE_EMPLOYEE', 'EMPLOYEE', employeeId, `Toggled active status to ${active}`);
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `employees/${employeeId}`);
+  }
+}
+
+export async function deleteEmployeeRecord(isDemo: boolean, employeeId: string): Promise<void> {
+  if (isDemo) {
+    const list = await fetchEmployees(true);
+    const target = list.find(e => e.id === employeeId || e.employeeId === employeeId);
+    const targetEmpId = target?.employeeId || employeeId;
+    const updated = list.filter(e => e.id !== employeeId && e.employeeId !== employeeId);
+    localStorage.setItem(DEMO_EMPLOYEES_KEY, JSON.stringify(updated));
+
+    // Remove shifts for this employee
+    const shifts: Shift[] = JSON.parse(localStorage.getItem(DEMO_SHIFTS_KEY) || '[]');
+    const updatedShifts = shifts.filter(s => s.employeeId !== targetEmpId && s.employeeId !== employeeId);
+    localStorage.setItem(DEMO_SHIFTS_KEY, JSON.stringify(updatedShifts));
+
+    // Remove all payroll records for this employee
+    const payRecs: PayrollRecord[] = JSON.parse(localStorage.getItem(DEMO_PAYROLL_RECORDS_KEY) || '[]');
+    const updatedPayRecs = payRecs.filter(r => r.employeeId !== targetEmpId && r.employeeId !== employeeId);
+    localStorage.setItem(DEMO_PAYROLL_RECORDS_KEY, JSON.stringify(updatedPayRecs));
+
+    await logAudit(true, 'DELETE_EMPLOYEE', 'EMPLOYEE', employeeId, `Permanently deleted employee ${target?.fullName || employeeId}`);
+    return;
+  }
+
+  try {
+    const empDoc = await getDoc(doc(db, 'employees', employeeId));
+    const empData = empDoc.exists() ? (empDoc.data() as Employee) : null;
+    const targetEmpId = empData?.employeeId || employeeId;
+
+    await deleteDoc(doc(db, 'employees', employeeId));
+
+    // Clean up shifts
+    const schedulesSnap = await getDocs(collection(db, 'schedules'));
+    for (const schedDoc of schedulesSnap.docs) {
+      const shiftsSnap = await getDocs(
+        query(collection(db, 'schedules', schedDoc.id, 'shifts'), where('employeeId', '==', targetEmpId))
+      );
+      for (const s of shiftsSnap.docs) {
+        await deleteDoc(s.ref);
+      }
+    }
+
+    // Clean up payroll records
+    const paySnap = await getDocs(
+      query(collection(db, 'payrollRecords'), where('employeeId', '==', targetEmpId))
+    );
+    for (const p of paySnap.docs) {
+      await deleteDoc(p.ref);
+    }
+
+    await logAudit(false, 'DELETE_EMPLOYEE', 'EMPLOYEE', employeeId, `Permanently deleted employee ${empData?.fullName || employeeId}`);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `employees/${employeeId}`);
+  }
+}
+
+export async function deleteAllEmployees(isDemo: boolean): Promise<void> {
+  if (isDemo) {
+    localStorage.setItem(DEMO_EMPLOYEES_KEY, JSON.stringify([]));
+    localStorage.setItem(DEMO_SHIFTS_KEY, JSON.stringify([]));
+    localStorage.setItem(DEMO_PAYROLL_RECORDS_KEY, JSON.stringify([]));
+    await logAudit(true, 'DELETE_ALL_EMPLOYEES', 'EMPLOYEE', 'ALL', 'Cleared all employees, shifts, and payroll records.');
+    return;
+  }
+
+  try {
+    const empSnap = await getDocs(collection(db, 'employees'));
+    for (const d of empSnap.docs) {
+      await deleteDoc(d.ref);
+    }
+
+    const schedulesSnap = await getDocs(collection(db, 'schedules'));
+    for (const schedDoc of schedulesSnap.docs) {
+      const shiftsSnap = await getDocs(collection(db, 'schedules', schedDoc.id, 'shifts'));
+      for (const s of shiftsSnap.docs) {
+        await deleteDoc(s.ref);
+      }
+    }
+
+    const paySnap = await getDocs(collection(db, 'payrollRecords'));
+    for (const p of paySnap.docs) {
+      await deleteDoc(p.ref);
+    }
+
+    await logAudit(false, 'DELETE_ALL_EMPLOYEES', 'EMPLOYEE', 'ALL', 'Cleared all employees, shifts, and payroll records.');
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, 'employees');
   }
 }
 
@@ -177,15 +303,8 @@ export async function seed25SampleEmployeesToFirestore(): Promise<number> {
 export async function fetchShiftsForWeek(isDemo: boolean, fridayYmd: string): Promise<Shift[]> {
   if (isDemo) {
     const saved = localStorage.getItem(DEMO_SHIFTS_KEY);
-    let allShifts: Shift[] = saved ? JSON.parse(saved) : [];
-    let weekShifts = allShifts.filter(s => s.scheduleId === fridayYmd);
-    if (weekShifts.length === 0) {
-      // Auto-generate sample shifts for this demo week if none exist
-      weekShifts = generateSampleShiftsForWeek(fridayYmd);
-      const combined = [...allShifts.filter(s => s.scheduleId !== fridayYmd), ...weekShifts];
-      localStorage.setItem(DEMO_SHIFTS_KEY, JSON.stringify(combined));
-    }
-    return weekShifts;
+    const allShifts: Shift[] = saved ? JSON.parse(saved) : [];
+    return allShifts.filter(s => s.scheduleId === fridayYmd);
   }
 
   try {
@@ -212,13 +331,16 @@ export async function saveShiftRecord(isDemo: boolean, fridayYmd: string, shift:
   }
 
   const shiftDocId = shift.id || `shift_${shift.employeeId}_${shift.date}`;
-  const payload: Shift = {
+  const rawPayload: Shift = {
     ...shift,
     id: shiftDocId,
     scheduleId: fridayYmd,
     updatedAt: new Date().toISOString(),
     createdAt: shift.createdAt || new Date().toISOString(),
   };
+  const payload = Object.fromEntries(
+    Object.entries(rawPayload).filter(([, v]) => v !== undefined)
+  );
 
   try {
     // Ensure schedule doc exists
@@ -263,7 +385,10 @@ export async function copyShiftsFromWeek(
   targetFridayYmd: string,
   options?: CopyScheduleOptions
 ): Promise<number> {
-  const sourceShifts = await fetchShiftsForWeek(isDemo, sourceFridayYmd);
+  const rawSourceShifts = await fetchShiftsForWeek(isDemo, sourceFridayYmd);
+  const allEmployees = await fetchEmployees(isDemo);
+  const activeEmpIds = new Set(allEmployees.filter(e => e.active).map(e => e.employeeId));
+  const sourceShifts = rawSourceShifts.filter(s => activeEmpIds.has(s.employeeId));
   if (sourceShifts.length === 0) return 0;
 
   const mode = options?.mode || 'merge';
@@ -394,7 +519,13 @@ export async function generateWeeklyPayroll(
     try {
       const all: PayrollRecord[] = JSON.parse(localStorage.getItem(DEMO_PAYROLL_RECORDS_KEY) || '[]');
       existingRecords = all.filter((r) => r.periodId === periodId);
-    } catch (e) {
+    } catch {
+      existingRecords = [];
+    }
+  } else {
+    try {
+      existingRecords = await fetchPayrollRecords(false, periodId);
+    } catch {
       existingRecords = [];
     }
   }
@@ -441,8 +572,9 @@ export async function generateWeeklyPayroll(
     const ss = isManualTax ? (existingRec?.manualSocialSecurityTax ?? calc.socialSecurityTax) : calc.socialSecurityTax;
     const med = isManualTax ? (existingRec?.manualMedicareTax ?? calc.medicareTax) : calc.medicareTax;
     const totalTaxes = isManualTax ? Math.round((fed + va + ss + med) * 100) / 100 : calc.totalTaxes;
-    const totalDeductions = calc.totalDeductions;
-    const netPay = Math.round((calc.grossPay - totalTaxes - totalDeductions) * 100) / 100;
+    const nonTaxDeductions = (calc.insuranceDeduction || 0) + (calc.otherDeductions || 0);
+    const totalDeductions = Math.round((totalTaxes + nonTaxDeductions) * 100) / 100;
+    const netPay = Math.max(0, Math.round((calc.grossPay - totalDeductions) * 100) / 100);
 
     const paymentMethod: PaymentMethod = existingRec?.paymentMethod || 'ALL_CHECK';
     let taxableHours = existingRec?.taxableHours !== undefined ? existingRec.taxableHours : hoursSummary.totalHours;
@@ -560,9 +692,20 @@ export async function generateWeeklyPayroll(
     // Save period
     await setDoc(doc(db, 'payrollPeriods', periodId), period);
 
-    // Save individual records
+    // Delete stale payroll records for this period that are no longer active/working
+    const validIds = new Set(records.map((r) => r.id));
+    for (const oldRec of existingRecords) {
+      if (!validIds.has(oldRec.id)) {
+        await deleteDoc(doc(db, 'payrollRecords', oldRec.id));
+      }
+    }
+
+    // Save individual records (stripping undefined properties so Firestore never rejects)
     for (const rec of records) {
-      await setDoc(doc(db, 'payrollRecords', rec.id), rec);
+      const cleanRec = Object.fromEntries(
+        Object.entries(rec).filter(([, v]) => v !== undefined)
+      );
+      await setDoc(doc(db, 'payrollRecords', rec.id), cleanRec);
     }
 
     await logAudit(false, 'GENERATE_PAYROLL', 'PAYROLL', periodId, `Generated payroll for ${records.length} employees (Gross: $${period.totalGrossPay})`);
@@ -1065,7 +1208,9 @@ export async function savePayrollRecordPaymentAndTaxes(
       totalTaxes = recalculated.totalTaxes;
     }
 
-    const netPay = Math.round((rec.grossPay - totalTaxes - rec.totalDeductions) * 100) / 100;
+    const nonTaxDeductions = (rec.insuranceDeduction || 0) + (rec.otherDeductions || 0);
+    const totalDeductions = Math.round((totalTaxes + nonTaxDeductions) * 100) / 100;
+    const netPay = Math.max(0, Math.round((rec.grossPay - totalDeductions) * 100) / 100);
 
     let checkAmount = netPay;
     let cashAmount = 0;
@@ -1098,6 +1243,7 @@ export async function savePayrollRecordPaymentAndTaxes(
       socialSecurityTax: ss,
       medicareTax: med,
       totalTaxes,
+      totalDeductions,
       netPay,
       notes: updates.notes !== undefined ? updates.notes : rec.notes,
       updatedAt: new Date().toISOString(),
@@ -1115,6 +1261,7 @@ export async function savePayrollRecordPaymentAndTaxes(
         existingPeriods[pIdx] = {
           ...existingPeriods[pIdx],
           totalTaxes: Math.round(periodRecords.reduce((s, r) => s + r.totalTaxes, 0) * 100) / 100,
+          totalDeductions: Math.round(periodRecords.reduce((s, r) => s + (r.totalDeductions || r.totalTaxes), 0) * 100) / 100,
           totalNetPay: Math.round(periodRecords.reduce((s, r) => s + r.netPay, 0) * 100) / 100,
           updatedAt: new Date().toISOString(),
         };
@@ -1151,9 +1298,30 @@ export async function savePayrollRecordPaymentAndTaxes(
       ss = updates.manualSocialSecurityTax !== undefined ? updates.manualSocialSecurityTax : rec.socialSecurityTax;
       med = updates.manualMedicareTax !== undefined ? updates.manualMedicareTax : rec.medicareTax;
       totalTaxes = Math.round((fed + va + ss + med) * 100) / 100;
+    } else {
+      const recalculated = calculatePayroll({
+        hourlyWage: rec.hourlyWage,
+        regularHours: rec.regularHours,
+        overtimeHours: rec.overtimeHours,
+        settings,
+        insuranceDeduction: rec.insuranceDeduction,
+        otherDeductions: rec.otherDeductions,
+        adjustments: rec.adjustments,
+        withholdFederal: rec.withholdFederal,
+        withholdVirginia: rec.withholdVirginia,
+        withholdSocialSecurity: rec.withholdSocialSecurity,
+        withholdMedicare: rec.withholdMedicare,
+      });
+      fed = recalculated.federalWithholding;
+      va = recalculated.vaWithholding;
+      ss = recalculated.socialSecurityTax;
+      med = recalculated.medicareTax;
+      totalTaxes = recalculated.totalTaxes;
     }
 
-    const netPay = Math.round((rec.grossPay - totalTaxes - rec.totalDeductions) * 100) / 100;
+    const nonTaxDeductions = (rec.insuranceDeduction || 0) + (rec.otherDeductions || 0);
+    const totalDeductions = Math.round((totalTaxes + nonTaxDeductions) * 100) / 100;
+    const netPay = Math.max(0, Math.round((rec.grossPay - totalDeductions) * 100) / 100);
 
     let checkAmount = netPay;
     let cashAmount = 0;
@@ -1168,26 +1336,30 @@ export async function savePayrollRecordPaymentAndTaxes(
       cashAmount = updates.cashAmount !== undefined ? updates.cashAmount : (rec.cashAmount ?? 0);
     }
 
-    const payload = {
+    const rawPayload: Record<string, unknown> = {
       paymentMethod: updates.paymentMethod,
-      taxableHours: updates.taxableHours,
-      cashHours: updates.cashHours,
       checkAmount,
       cashAmount,
       isManualTax: updates.isManualTax ?? false,
-      manualFederalWithholding: updates.manualFederalWithholding,
-      manualVaWithholding: updates.manualVaWithholding,
-      manualSocialSecurityTax: updates.manualSocialSecurityTax,
-      manualMedicareTax: updates.manualMedicareTax,
       federalWithholding: fed,
       vaWithholding: va,
       socialSecurityTax: ss,
       medicareTax: med,
       totalTaxes,
+      totalDeductions,
       netPay,
-      notes: updates.notes !== undefined ? updates.notes : rec.notes,
+      notes: updates.notes !== undefined ? updates.notes : (rec.notes ?? ''),
       updatedAt: new Date().toISOString(),
     };
+
+    if (updates.taxableHours !== undefined) rawPayload.taxableHours = updates.taxableHours;
+    if (updates.cashHours !== undefined) rawPayload.cashHours = updates.cashHours;
+    if (updates.manualFederalWithholding !== undefined) rawPayload.manualFederalWithholding = updates.manualFederalWithholding;
+    if (updates.manualVaWithholding !== undefined) rawPayload.manualVaWithholding = updates.manualVaWithholding;
+    if (updates.manualSocialSecurityTax !== undefined) rawPayload.manualSocialSecurityTax = updates.manualSocialSecurityTax;
+    if (updates.manualMedicareTax !== undefined) rawPayload.manualMedicareTax = updates.manualMedicareTax;
+
+    const payload = rawPayload;
 
     await updateDoc(recRef, payload);
 
@@ -1278,6 +1450,7 @@ export async function fetchStoreSettings(isDemo: boolean): Promise<StoreSettings
 
 export async function saveStoreSettingsRecord(isDemo: boolean, settings: StoreSettings): Promise<void> {
   const adminEmail = auth.currentUser?.email || (isDemo ? 'demo.admin@hanaromarket.com' : 'admin@hanaromarket.com');
+  const isOwner = adminEmail.toLowerCase() === 'jaraman1215@gmail.com';
   const payload: StoreSettings = {
     ...settings,
     updatedAt: new Date().toISOString(),
@@ -1291,8 +1464,52 @@ export async function saveStoreSettingsRecord(isDemo: boolean, settings: StoreSe
   }
 
   try {
-    await setDoc(doc(db, 'settings', 'store_settings'), payload);
+    const cleanPayload: Record<string, unknown> = { ...payload };
+    if (!isOwner) {
+      delete cleanPayload.workspacePasscode;
+    }
+    await setDoc(doc(db, 'settings', 'store_settings'), cleanPayload, { merge: true });
     await logAudit(false, 'UPDATE_SETTINGS', 'SETTINGS', 'store_settings', 'Updated tax rates and store details');
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, 'settings/store_settings');
+  }
+}
+
+export async function saveWorkspacePasscode(isDemo: boolean, newPasscode: string): Promise<void> {
+  if (!/^\d{6}$/.test(newPasscode)) {
+    throw new Error('Passcode must be exactly 6 numeric digits.');
+  }
+
+  const adminEmail = auth.currentUser?.email || '';
+  if (!isDemo && adminEmail.toLowerCase() !== 'jaraman1215@gmail.com') {
+    throw new Error('Only jaraman1215@gmail.com is authorized to modify the workspace passcode.');
+  }
+
+  if (isDemo) {
+    const current = await fetchStoreSettings(true);
+    const updated: StoreSettings = {
+      ...current,
+      workspacePasscode: newPasscode,
+      updatedAt: new Date().toISOString(),
+      updatedBy: adminEmail || 'jaraman1215@gmail.com',
+    };
+    localStorage.setItem(DEMO_SETTINGS_KEY, JSON.stringify(updated));
+    await logAudit(true, 'UPDATE_PASSCODE', 'SETTINGS', 'store_settings', 'Updated 6-digit workspace entry passcode');
+    return;
+  }
+
+  try {
+    await setDoc(
+      doc(db, 'settings', 'store_settings'),
+      {
+        id: 'store_settings',
+        workspacePasscode: newPasscode,
+        updatedAt: new Date().toISOString(),
+        updatedBy: adminEmail,
+      },
+      { merge: true }
+    );
+    await logAudit(false, 'UPDATE_PASSCODE', 'SETTINGS', 'store_settings', 'Updated 6-digit workspace entry passcode');
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, 'settings/store_settings');
   }
@@ -1321,24 +1538,37 @@ export async function fetchAuditLogs(isDemo: boolean): Promise<AuditLog[]> {
 }
 
 // ---------------- ADMINISTRATORS ----------------
+const DEFAULT_DEMO_ADMINS: Administrator[] = [
+  {
+    uid: 'demo_admin_1',
+    email: 'jaraman1215@gmail.com',
+    loginId: 'jaraman1215@gmail.com',
+    name: 'Primary Owner (Admin)',
+    role: 'super_admin',
+    createdAt: '2026-11-06T08:00:00Z',
+  },
+  {
+    uid: 'demo_admin_2',
+    email: 'manager@culmore.local',
+    loginId: 'manager',
+    name: 'Assistant Manager',
+    role: 'manager',
+    createdAt: '2026-11-06T08:00:00Z',
+  },
+];
+
 export async function fetchAdministrators(isDemo: boolean): Promise<Administrator[]> {
   if (isDemo) {
-    return [
-      {
-        uid: 'demo_admin_1',
-        email: 'jaraman1215@gmail.com',
-        name: 'Primary Owner (Admin)',
-        role: 'super_admin',
-        createdAt: '2026-11-06T08:00:00Z',
-      },
-      {
-        uid: 'demo_admin_2',
-        email: 'manager@hanaromarket.com',
-        name: 'Assistant Manager',
-        role: 'manager',
-        createdAt: '2026-11-06T08:00:00Z',
+    const saved = localStorage.getItem(DEMO_ADMINS_KEY);
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch {
+        return DEFAULT_DEMO_ADMINS;
       }
-    ];
+    }
+    localStorage.setItem(DEMO_ADMINS_KEY, JSON.stringify(DEFAULT_DEMO_ADMINS));
+    return DEFAULT_DEMO_ADMINS;
   }
 
   try {
@@ -1346,5 +1576,80 @@ export async function fetchAdministrators(isDemo: boolean): Promise<Administrato
     return snap.docs.map(d => ({ ...d.data(), uid: d.id } as Administrator));
   } catch (error) {
     handleFirestoreError(error, OperationType.LIST, 'administrators');
+  }
+}
+
+export async function saveAdministratorRecord(
+  isDemo: boolean,
+  input: { emailOrId: string; role: AdminRole; name: string }
+): Promise<Administrator> {
+  const trimmed = input.emailOrId.trim();
+  const isEmail = trimmed.includes('@');
+  const cleanId = isEmail ? trimmed.toLowerCase() : trimmed.replace(/[^a-zA-Z0-9._-]/g, '').toLowerCase();
+  const normalizedEmail = isEmail ? cleanId : `${cleanId}@culmore.local`;
+  const docId = `prov_${normalizedEmail.replace(/[^a-zA-Z0-9]/g, '_')}`.slice(0, 120);
+
+  const adminRecord: Administrator = {
+    uid: docId,
+    email: normalizedEmail,
+    loginId: cleanId,
+    name: input.name.trim() || cleanId,
+    role: input.role,
+    createdAt: new Date().toISOString(),
+    createdBy: auth.currentUser?.email || 'admin',
+  };
+
+  if (isDemo) {
+    const list = await fetchAdministrators(true);
+    const updated = [adminRecord, ...list.filter(a => a.email !== normalizedEmail && a.uid !== docId)];
+    localStorage.setItem(DEMO_ADMINS_KEY, JSON.stringify(updated));
+    await logAudit(true, 'PROVISION_ADMIN', 'ADMIN', docId, `Provisioned ${adminRecord.loginId} as ${adminRecord.role}`);
+    return adminRecord;
+  }
+
+  try {
+    await setDoc(doc(db, 'administrators', docId), adminRecord);
+    await logAudit(false, 'PROVISION_ADMIN', 'ADMIN', docId, `Provisioned ${adminRecord.loginId} as ${adminRecord.role}`);
+    return adminRecord;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `administrators/${docId}`);
+  }
+}
+
+export async function updateAdministratorRole(
+  isDemo: boolean,
+  uid: string,
+  role: AdminRole
+): Promise<void> {
+  if (isDemo) {
+    const list = await fetchAdministrators(true);
+    const updated = list.map(a => (a.uid === uid ? { ...a, role } : a));
+    localStorage.setItem(DEMO_ADMINS_KEY, JSON.stringify(updated));
+    await logAudit(true, 'UPDATE_ADMIN_ROLE', 'ADMIN', uid, `Updated role to ${role}`);
+    return;
+  }
+
+  try {
+    await updateDoc(doc(db, 'administrators', uid), { role });
+    await logAudit(false, 'UPDATE_ADMIN_ROLE', 'ADMIN', uid, `Updated role to ${role}`);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `administrators/${uid}`);
+  }
+}
+
+export async function deleteAdministratorRecord(isDemo: boolean, uid: string): Promise<void> {
+  if (isDemo) {
+    const list = await fetchAdministrators(true);
+    const updated = list.filter(a => a.uid !== uid);
+    localStorage.setItem(DEMO_ADMINS_KEY, JSON.stringify(updated));
+    await logAudit(true, 'DELETE_ADMIN', 'ADMIN', uid, `Removed administrator ${uid}`);
+    return;
+  }
+
+  try {
+    await deleteDoc(doc(db, 'administrators', uid));
+    await logAudit(false, 'DELETE_ADMIN', 'ADMIN', uid, `Removed administrator ${uid}`);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `administrators/${uid}`);
   }
 }

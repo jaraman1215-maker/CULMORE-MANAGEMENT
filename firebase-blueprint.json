@@ -7,6 +7,7 @@
       "properties": {
         "uid": { "type": "string", "maxLength": 128 },
         "email": { "type": "string", "maxLength": 128 },
+        "loginId": { "type": "string", "maxLength": 64 },
         "name": { "type": "string", "maxLength": 128 },
         "role": { "type": "string", "enum": ["super_admin", "admin", "manager"] },
         "createdAt": { "type": "string", "format": "date-time" },
@@ -21,6 +22,7 @@
       "properties": {
         "employeeId": { "type": "string", "maxLength": 32 },
         "fullName": { "type": "string", "maxLength": 100 },
+        "nickname": { "type": "string", "maxLength": 50 },
         "position": { "type": "string", "maxLength": 50 },
         "department": { "type": "string", "maxLength": 50 },
         "active": { "type": "boolean" },
@@ -138,6 +140,7 @@
         "overtimeMultiplier": { "type": "number" },
         "defaultBreakMinutes": { "type": "number" },
         "workWeekStartDay": { "type": "string", "maxLength": 20 },
+        "workspacePasscode": { "type": "string", "minLength": 6, "maxLength": 6, "pattern": "^[0-9]{6}$" },
         "updatedAt": { "type": "string", "format": "date-time" },
         "updatedBy": { "type": "string", "maxLength": 128 }
       },
@@ -157,6 +160,27 @@
         "timestamp": { "type": "string", "format": "date-time" }
       },
       "required": ["action", "entity", "performedByEmail", "timestamp"]
+    },
+    "PasswordResetRequest": {
+      "title": "PasswordResetRequest",
+      "description": "Admin-initiated temporary verification code requests for resetting forgotten employee or admin passwords.",
+      "type": "object",
+      "properties": {
+        "targetType": { "type": "string", "enum": ["employee", "admin"] },
+        "targetUid": { "type": "string", "maxLength": 128 },
+        "targetName": { "type": "string", "maxLength": 128 },
+        "email": { "type": "string", "maxLength": 128 },
+        "loginId": { "type": "string", "maxLength": 128 },
+        "codeHash": { "type": "string", "minLength": 64, "maxLength": 64 },
+        "firebaseEmailSent": { "type": "boolean" },
+        "status": { "type": "string", "enum": ["pending", "verified", "completed", "expired", "revoked"] },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "requestedBy": { "type": "string", "maxLength": 128 },
+        "verifiedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["targetType", "targetName", "email", "codeHash", "firebaseEmailSent", "status", "expiresAt", "createdAt", "requestedBy"]
     }
   },
   "firestore": {
@@ -191,6 +215,10 @@
     "/auditLogs/{logId}": {
       "schema": { "$ref": "#/entities/AuditLog" },
       "description": "Audit trail for compliance and tracking."
+    },
+    "/passwordResetRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/PasswordResetRequest" },
+      "description": "Hashed temporary verification code records for admin-assisted password resets."
     }
   }
 }

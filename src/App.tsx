@@ -1,12 +1,15 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { collection, doc, onSnapshot, query, where } from 'firebase/firestore';
 import { LanguageProvider, useLanguage } from './context/LanguageContext';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ExchangeRateProvider } from './context/ExchangeRateContext';
-import { testConnection } from './firebase/config';
+import { db, testConnection } from './firebase/config';
 import {
   fetchEmployees,
   saveEmployeeRecord,
   archiveEmployeeRecord,
+  deleteEmployeeRecord,
+  deleteAllEmployees,
   fetchShiftsForWeek,
   saveShiftRecord,
   deleteShiftRecord,
@@ -28,7 +31,11 @@ import {
   saveStoreSettingsRecord,
   fetchAuditLogs,
   fetchAdministrators,
+  saveAdministratorRecord,
+  updateAdministratorRole,
+  deleteAdministratorRecord,
   seed25SampleEmployeesToFirestore,
+  saveWorkspacePasscode,
 } from './firebase/dataService';
 import {
   Employee,
@@ -38,11 +45,18 @@ import {
   StoreSettings,
   AuditLog,
   Administrator,
+  AdminRole,
   PayrollAdjustment,
 } from './types';
 import { INITIAL_STORE_SETTINGS } from './utils/demoData';
-import { getWorkWeekFriday } from './utils/dateUtils';
+import { getDaysInWorkWeek, getWorkWeekFriday } from './utils/dateUtils';
 import { calculateShiftHours, isCashierEmployee } from './utils/calculations';
+import {
+  saveScheduleAutoBackup,
+  buildFinalPayrollArchive,
+  saveFinalPayrollArchiveLocal,
+  downloadFinalPayrollArchiveToComputer,
+} from './utils/backupUtils';
 import { Sidebar, ActiveTab } from './components/Sidebar';
 import { Header } from './components/Header';
 import { DashboardView } from './components/DashboardView';
@@ -54,6 +68,8 @@ import { SettingsAndAuditView } from './components/SettingsAndAuditView';
 import { AdminManualView } from './components/AdminManualView';
 import { CalculationTestModal } from './components/CalculationTestModal';
 import { AuthModal } from './components/AuthModal';
+import { PasscodeGateModal } from './components/PasscodeGateModal';
+import { PasswordResetModal, PasswordResetInitialTarget } from './components/PasswordResetModal';
 import { PrintScheduleStandaloneView } from './components/PrintScheduleStandaloneView';
 import { PrintPaystubStandaloneView } from './components/PrintPaystubStandaloneView';
 import { PrintPayrollRegisterStandaloneView } from './components/PrintPayrollRegisterStandaloneView';
@@ -68,6 +84,8 @@ const AppContent: React.FC = () => {
   );
   const [mobileOpen, setMobileOpen] = useState(false);
   const [showTestModal, setShowTestModal] = useState(false);
+  const [isPasswordResetOpen, setIsPasswordResetOpen] = useState(false);
+  const [passwordResetTarget, setPasswordResetTarget] = useState<PasswordResetInitialTarget | null>(null);
 
   // Core Data States
   const [employees, setEmployees] = useState<Employee[]>([]);
@@ -78,14 +96,20 @@ const AppContent: React.FC = () => {
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [administrators, setAdministrators] = useState<Administrator[]>([]);
   const [isLoadingData, setIsLoadingData] = useState(true);
+  const [isPasscodeUnlocked, setIsPasscodeUnlocked] = useState<boolean>(false);
+  const [isSettingsReady, setIsSettingsReady] = useState<boolean>(false);
 
   // Mandatory Skill Test Connection
   useEffect(() => {
     testConnection();
   }, []);
 
-  // Fetch all primary datasets
+  // Fetch all primary datasets (used for Demo Mode or fallback refresh)
   const loadAllData = useCallback(async () => {
+    if (!isDemoMode && !isAdmin) {
+      setIsLoadingData(false);
+      return;
+    }
     try {
       setIsLoadingData(true);
       const [empList, sett, audits, admins] = await Promise.all([
@@ -97,6 +121,7 @@ const AppContent: React.FC = () => {
 
       setEmployees(empList);
       setSettings(sett);
+      setIsSettingsReady(true);
       setAuditLogs(audits);
       setAdministrators(admins);
 
@@ -116,14 +141,139 @@ const AppContent: React.FC = () => {
       }
     } catch (err) {
       console.error('Error loading application data:', err);
+      setIsSettingsReady(true);
     } finally {
       setIsLoadingData(false);
     }
-  }, [isDemoMode, currentWeekFriday]);
+  }, [isDemoMode, isAdmin, currentWeekFriday]);
 
   useEffect(() => {
-    loadAllData();
-  }, [loadAllData]);
+    if (isDemoMode) {
+      loadAllData();
+      return;
+    }
+    if (!isAdmin) {
+      setIsLoadingData(false);
+      return;
+    }
+
+    // Live Cloud Firestore real-time synchronization across PC, laptop, and tablet
+    setIsLoadingData(true);
+    const periodId = `period_${currentWeekFriday}`;
+
+    const unsubEmployees = onSnapshot(
+      collection(db, 'employees'),
+      (snap) => {
+        setEmployees(snap.docs.map((d) => ({ ...d.data(), id: d.id } as Employee)));
+        setIsLoadingData(false);
+      },
+      (err) => {
+        console.error('Firestore employees listener error:', err);
+        setIsLoadingData(false);
+      }
+    );
+
+    const unsubShifts = onSnapshot(
+      collection(db, 'schedules', currentWeekFriday, 'shifts'),
+      (snap) => {
+        setShifts(snap.docs.map((d) => ({ ...d.data(), id: d.id } as Shift)));
+      },
+      (err) => {
+        console.error('Firestore shifts listener error:', err);
+      }
+    );
+
+    const unsubPeriod = onSnapshot(
+      doc(db, 'payrollPeriods', periodId),
+      (snap) => {
+        setPayrollPeriod(snap.exists() ? (snap.data() as PayrollPeriod) : null);
+      },
+      (err) => {
+        console.error('Firestore payrollPeriod listener error:', err);
+      }
+    );
+
+    const unsubRecords = onSnapshot(
+      query(collection(db, 'payrollRecords'), where('periodId', '==', periodId)),
+      (snap) => {
+        setPayrollRecords(snap.docs.map((d) => ({ ...d.data(), id: d.id } as PayrollRecord)));
+      },
+      (err) => {
+        console.error('Firestore payrollRecords listener error:', err);
+      }
+    );
+
+    const unsubSettings = onSnapshot(
+      doc(db, 'settings', 'store_settings'),
+      (snap) => {
+        if (snap.exists()) {
+          setSettings(snap.data() as StoreSettings);
+          setIsSettingsReady(true);
+        } else {
+          fetchStoreSettings(false)
+            .then((s) => {
+              setSettings(s);
+              setIsSettingsReady(true);
+            })
+            .catch(() => setIsSettingsReady(true));
+        }
+      },
+      (err) => {
+        console.error('Firestore settings listener error:', err);
+        setIsSettingsReady(true);
+      }
+    );
+
+    const unsubAdmins = onSnapshot(
+      collection(db, 'administrators'),
+      (snap) => {
+        setAdministrators(snap.docs.map((d) => ({ ...d.data(), uid: d.id } as Administrator)));
+      },
+      (err) => {
+        console.error('Firestore administrators listener error:', err);
+      }
+    );
+
+    const unsubAudits = onSnapshot(
+      collection(db, 'auditLogs'),
+      (snap) => {
+        const list = snap.docs.map((d) => ({ ...d.data(), id: d.id } as AuditLog));
+        list.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+        setAuditLogs(list.slice(0, 50));
+      },
+      (err) => {
+        console.error('Firestore auditLogs listener error:', err);
+      }
+    );
+
+    return () => {
+      unsubEmployees();
+      unsubShifts();
+      unsubPeriod();
+      unsubRecords();
+      unsubSettings();
+      unsubAdmins();
+      unsubAudits();
+    };
+  }, [isDemoMode, isAdmin, currentWeekFriday, loadAllData]);
+
+  // Helper to sync open payroll strictly using registered active employees
+  const syncOpenPayrollStrict = async (empList: Employee[], weekShifts: Shift[]) => {
+    const activeEmps = empList.filter((e) => e.active);
+    const activeIds = new Set(activeEmps.map((e) => e.employeeId));
+    const activeShifts = weekShifts.filter((s) => activeIds.has(s.employeeId));
+    if ((payrollPeriod && payrollPeriod.status !== 'finalized') || (!payrollPeriod && activeShifts.length > 0)) {
+      const { period, records } = await generateWeeklyPayroll(
+        isDemoMode,
+        currentWeekFriday,
+        activeEmps,
+        activeShifts,
+        settings
+      );
+      setPayrollPeriod(period);
+      setPayrollRecords(records);
+    }
+  };
 
   // Handlers for Employee modifications
   const handleSaveEmployee = async (emp: Employee) => {
@@ -154,40 +304,51 @@ const AppContent: React.FC = () => {
       }
     }
 
-    await loadAllData();
-
-    // Auto-sync with open payroll
-    if (payrollPeriod && payrollPeriod.status !== 'finalized') {
-      const updatedEmps = await fetchEmployees(isDemoMode);
-      const updatedShifts = await fetchShiftsForWeek(isDemoMode, currentWeekFriday);
-      const { period, records } = await generateWeeklyPayroll(
-        isDemoMode,
-        currentWeekFriday,
-        updatedEmps.filter((e) => e.active),
-        updatedShifts,
-        settings
-      );
-      setPayrollPeriod(period);
-      setPayrollRecords(records);
-    }
+    const [updatedEmps, updatedShifts] = await Promise.all([
+      fetchEmployees(isDemoMode),
+      fetchShiftsForWeek(isDemoMode, currentWeekFriday),
+    ]);
+    if (isDemoMode) await loadAllData();
+    await syncOpenPayrollStrict(updatedEmps, updatedShifts);
   };
 
   const handleArchiveEmployee = async (employeeId: string, active: boolean) => {
     await archiveEmployeeRecord(isDemoMode, employeeId, active);
-    await loadAllData();
+    const [updatedEmps, updatedShifts] = await Promise.all([
+      fetchEmployees(isDemoMode),
+      fetchShiftsForWeek(isDemoMode, currentWeekFriday),
+    ]);
+    if (isDemoMode) await loadAllData();
+    await syncOpenPayrollStrict(updatedEmps, updatedShifts);
+  };
+
+  const handleDeleteEmployee = async (employeeId: string) => {
+    await deleteEmployeeRecord(isDemoMode, employeeId);
+    const [updatedEmps, updatedShifts] = await Promise.all([
+      fetchEmployees(isDemoMode),
+      fetchShiftsForWeek(isDemoMode, currentWeekFriday),
+    ]);
+    if (isDemoMode) await loadAllData();
+    await syncOpenPayrollStrict(updatedEmps, updatedShifts);
+  };
+
+  const handleDeleteAllEmployees = async () => {
+    await deleteAllEmployees(isDemoMode);
+    setEmployees([]);
+    setShifts([]);
+    setPayrollRecords([]);
     if (payrollPeriod && payrollPeriod.status !== 'finalized') {
-      const updatedEmps = await fetchEmployees(isDemoMode);
-      const updatedShifts = await fetchShiftsForWeek(isDemoMode, currentWeekFriday);
       const { period, records } = await generateWeeklyPayroll(
         isDemoMode,
         currentWeekFriday,
-        updatedEmps.filter((e) => e.active),
-        updatedShifts,
+        [],
+        [],
         settings
       );
       setPayrollPeriod(period);
       setPayrollRecords(records);
     }
+    if (isDemoMode) await loadAllData();
   };
 
   // Handlers for Shifts & Schedules
@@ -195,38 +356,16 @@ const AppContent: React.FC = () => {
     await saveShiftRecord(isDemoMode, currentWeekFriday, shift);
     const updated = await fetchShiftsForWeek(isDemoMode, currentWeekFriday);
     setShifts(updated);
-
-    // Auto-sync with open payroll period immediately
-    if (payrollPeriod && payrollPeriod.status !== 'finalized') {
-      const { period, records } = await generateWeeklyPayroll(
-        isDemoMode,
-        currentWeekFriday,
-        employees.filter((e) => e.active),
-        updated,
-        settings
-      );
-      setPayrollPeriod(period);
-      setPayrollRecords(records);
-    }
+    saveScheduleAutoBackup(currentWeekFriday, updated, 'auto');
+    await syncOpenPayrollStrict(employees, updated);
   };
 
   const handleDeleteShift = async (shiftId: string) => {
     await deleteShiftRecord(isDemoMode, currentWeekFriday, shiftId);
     const updated = await fetchShiftsForWeek(isDemoMode, currentWeekFriday);
     setShifts(updated);
-
-    // Auto-sync with open payroll period immediately
-    if (payrollPeriod && payrollPeriod.status !== 'finalized') {
-      const { period, records } = await generateWeeklyPayroll(
-        isDemoMode,
-        currentWeekFriday,
-        employees.filter((e) => e.active),
-        updated,
-        settings
-      );
-      setPayrollPeriod(period);
-      setPayrollRecords(records);
-    }
+    saveScheduleAutoBackup(currentWeekFriday, updated, 'auto');
+    await syncOpenPayrollStrict(employees, updated);
   };
 
   const handleCopyFromPreviousWeek = async (
@@ -237,15 +376,95 @@ const AppContent: React.FC = () => {
     await copyShiftsFromWeek(isDemoMode, sourceFriday, targetFriday, options);
     const updated = await fetchShiftsForWeek(isDemoMode, targetFriday);
     setShifts(updated);
+    saveScheduleAutoBackup(targetFriday, updated, 'auto');
+    if (targetFriday === currentWeekFriday) {
+      await syncOpenPayrollStrict(employees, updated);
+    }
+  };
+
+  const handleRestoreScheduleBackup = async (
+    targetWeekFriday: string,
+    backupShifts: Shift[],
+    mode: 'merge' | 'overwrite'
+  ): Promise<number> => {
+    const targetDays = getDaysInWorkWeek(targetWeekFriday);
+    const activeEmps = employees.filter((e) => e.active);
+    const activeEmpMap = new Map(activeEmps.map((e) => [e.employeeId, e]));
+    const currentWeekShifts = await fetchShiftsForWeek(isDemoMode, targetWeekFriday);
+
+    if (mode === 'overwrite') {
+      for (const existing of currentWeekShifts) {
+        await deleteShiftRecord(isDemoMode, targetWeekFriday, existing.id);
+      }
+    }
+
+    const existingKeys = new Set(
+      mode === 'merge' ? currentWeekShifts.map((s) => `${s.employeeId}_${s.date}`) : []
+    );
+
+    let applied = 0;
+    for (const bakShift of backupShifts) {
+      const emp = activeEmpMap.get(bakShift.employeeId);
+      if (!emp) continue;
+
+      const matchedDay =
+        targetDays.find((d) => d.dayOfWeek === bakShift.dayOfWeek) ||
+        targetDays.find((d) => d.date === bakShift.date);
+      if (!matchedDay) continue;
+
+      const key = `${emp.employeeId}_${matchedDay.date}`;
+      if (mode === 'merge' && existingKeys.has(key)) continue;
+
+      const isCashier = isCashierEmployee(emp.department, emp.position);
+      const calc = calculateShiftHours(
+        bakShift.startTime,
+        bakShift.endTime,
+        bakShift.actualBreakMinutes ?? bakShift.breakMinutes,
+        isCashier
+      );
+
+      const newShift: Shift = {
+        ...bakShift,
+        id: `shift_${targetWeekFriday}_${emp.employeeId}_${matchedDay.date}`,
+        scheduleId: targetWeekFriday,
+        employeeId: emp.employeeId,
+        employeeName: emp.fullName,
+        date: matchedDay.date,
+        dayOfWeek: matchedDay.dayOfWeek,
+        hours: calc.hours,
+        rawHours: calc.rawHours,
+        paidBreakMinutes: calc.paidBreakMinutes,
+        actualBreakMinutes: calc.actualBreakMinutes,
+        excessBreakMinutes: calc.excessBreakMinutes,
+        isOvernight: calc.isOvernight,
+        businessGroup: emp.businessGroup || bakShift.businessGroup,
+        updatedAt: new Date().toISOString(),
+      };
+
+      await saveShiftRecord(isDemoMode, targetWeekFriday, newShift);
+      existingKeys.add(key);
+      applied++;
+    }
+
+    const updated = await fetchShiftsForWeek(isDemoMode, targetWeekFriday);
+    setShifts(updated);
+    saveScheduleAutoBackup(targetWeekFriday, updated, 'auto');
+    if (targetWeekFriday === currentWeekFriday) {
+      await syncOpenPayrollStrict(employees, updated);
+    }
+    return applied;
   };
 
   // Handlers for Payroll
   const handleGeneratePayroll = async () => {
+    const activeEmps = employees.filter((e) => e.active);
+    const activeIds = new Set(activeEmps.map((e) => e.employeeId));
+    const activeShifts = shifts.filter((s) => activeIds.has(s.employeeId));
     const { period, records } = await generateWeeklyPayroll(
       isDemoMode,
       currentWeekFriday,
-      employees.filter(e => e.active),
-      shifts,
+      activeEmps,
+      activeShifts,
       settings
     );
     setPayrollPeriod(period);
@@ -254,8 +473,26 @@ const AppContent: React.FC = () => {
 
   const handleFinalizePayroll = async (periodId: string) => {
     await finalizePayrollPeriod(isDemoMode, periodId);
-    const updated = await fetchPayrollPeriod(isDemoMode, periodId);
-    setPayrollPeriod(updated);
+    const [updatedPeriod, latestRecords] = await Promise.all([
+      fetchPayrollPeriod(isDemoMode, periodId),
+      fetchPayrollRecords(isDemoMode, periodId),
+    ]);
+    setPayrollPeriod(updatedPeriod);
+    setPayrollRecords(latestRecords);
+
+    if (updatedPeriod) {
+      const activeEmps = employees.filter((e) => e.active);
+      const activeIds = new Set(activeEmps.map((e) => e.employeeId));
+      const archive = buildFinalPayrollArchive({
+        period: updatedPeriod,
+        records: latestRecords.filter((r) => activeIds.has(r.employeeId)),
+        employees: activeEmps,
+        settings,
+        finalizedBy: updatedPeriod.finalizedBy || 'admin',
+      });
+      saveFinalPayrollArchiveLocal(archive);
+      downloadFinalPayrollArchiveToComputer(archive);
+    }
   };
 
   const handleReopenPayroll = async (periodId: string, reason: string) => {
@@ -345,8 +582,29 @@ const AppContent: React.FC = () => {
     setSettings(newSettings);
   };
 
-  const handleProvisionAdmin = async (email: string, role: 'admin' | 'manager', name: string) => {
-    // In production, invites/adds admin record
+  const handleUpdatePasscode = async (newPasscode: string) => {
+    await saveWorkspacePasscode(isDemoMode, newPasscode);
+    setSettings((prev) => ({
+      ...prev,
+      workspacePasscode: newPasscode,
+      updatedAt: new Date().toISOString(),
+    }));
+  };
+
+  const handleProvisionAdmin = async (emailOrId: string, role: AdminRole, name: string) => {
+    await saveAdministratorRecord(isDemoMode, { emailOrId, role, name });
+    const updatedAdmins = await fetchAdministrators(isDemoMode);
+    setAdministrators(updatedAdmins);
+  };
+
+  const handleUpdateAdminRole = async (uid: string, role: AdminRole) => {
+    await updateAdministratorRole(isDemoMode, uid, role);
+    const updatedAdmins = await fetchAdministrators(isDemoMode);
+    setAdministrators(updatedAdmins);
+  };
+
+  const handleDeleteAdmin = async (uid: string) => {
+    await deleteAdministratorRecord(isDemoMode, uid);
     const updatedAdmins = await fetchAdministrators(isDemoMode);
     setAdministrators(updatedAdmins);
   };
@@ -371,9 +629,30 @@ const AppContent: React.FC = () => {
     return <AuthModal />;
   }
 
-  // Standalone print schedule route (?print=schedule)
+  // Standalone print routes bypass passcode gate when already authenticated
   const urlParams = new URLSearchParams(window.location.search);
   const isPrintSchedule = urlParams.get('print') === 'schedule';
+  const isPrintPaystub = urlParams.get('print') === 'paystub';
+  const isPrintPayrollRegister = urlParams.get('print') === 'payroll_register';
+
+  // Require 6-digit workspace passcode before entering main workspace
+  if (!isPrintSchedule && !isPrintPaystub && !isPrintPayrollRegister && !isPasscodeUnlocked) {
+    if (!isSettingsReady && isLoadingData) {
+      return (
+        <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white text-sm font-bold">
+          Loading workspace security...
+        </div>
+      );
+    }
+    return (
+      <PasscodeGateModal
+        expectedPasscode={settings.workspacePasscode || '123456'}
+        onUnlock={() => setIsPasscodeUnlocked(true)}
+      />
+    );
+  }
+
+  // Standalone print schedule route (?print=schedule)
   if (isPrintSchedule) {
     const printWeek = urlParams.get('week') || currentWeekFriday;
     const printGroup = urlParams.get('group') || 'ALL';
@@ -391,7 +670,6 @@ const AppContent: React.FC = () => {
   }
 
   // Standalone print paystub route (?print=paystub)
-  const isPrintPaystub = urlParams.get('print') === 'paystub';
   if (isPrintPaystub) {
     const printWeek = urlParams.get('week') || currentWeekFriday;
     const printEmp = urlParams.get('emp') || (employees[0]?.employeeId ?? '');
@@ -407,7 +685,6 @@ const AppContent: React.FC = () => {
   }
 
   // Standalone print payroll register route (?print=payroll_register)
-  const isPrintPayrollRegister = urlParams.get('print') === 'payroll_register';
   if (isPrintPayrollRegister) {
     const printWeek = urlParams.get('week') || currentWeekFriday;
     const printGroup = urlParams.get('group') || 'ALL';
@@ -432,6 +709,7 @@ const AppContent: React.FC = () => {
         mobileOpen={mobileOpen}
         setMobileOpen={setMobileOpen}
         onOpenTestModal={() => setShowTestModal(true)}
+        onLockWorkspace={() => setIsPasscodeUnlocked(false)}
       />
 
       {/* Main Content Area */}
@@ -454,6 +732,10 @@ const AppContent: React.FC = () => {
               currentWeekFriday={currentWeekFriday}
               setActiveTab={setActiveTab}
               onOpenTestModal={() => setShowTestModal(true)}
+              onOpenPasswordReset={(target) => {
+                setPasswordResetTarget(target || null);
+                setIsPasswordResetOpen(true);
+              }}
             />
           )}
 
@@ -462,7 +744,13 @@ const AppContent: React.FC = () => {
               employees={employees}
               onSaveEmployee={handleSaveEmployee}
               onArchiveEmployee={handleArchiveEmployee}
+              onDeleteEmployee={handleDeleteEmployee}
+              onDeleteAllEmployees={handleDeleteAllEmployees}
               onSeedSampleData={handleSeedSampleData}
+              onOpenPasswordReset={(target) => {
+                setPasswordResetTarget(target || null);
+                setIsPasswordResetOpen(true);
+              }}
             />
           )}
 
@@ -475,6 +763,7 @@ const AppContent: React.FC = () => {
               onSaveShift={handleSaveShift}
               onDeleteShift={handleDeleteShift}
               onCopyFromPreviousWeek={handleCopyFromPreviousWeek}
+              onRestoreScheduleBackup={handleRestoreScheduleBackup}
             />
           )}
 
@@ -517,7 +806,14 @@ const AppContent: React.FC = () => {
               auditLogs={auditLogs}
               administrators={administrators}
               onSaveSettings={handleSaveSettings}
+              onUpdatePasscode={handleUpdatePasscode}
               onProvisionAdmin={handleProvisionAdmin}
+              onUpdateAdminRole={handleUpdateAdminRole}
+              onDeleteAdmin={handleDeleteAdmin}
+              onOpenPasswordReset={(target) => {
+                setPasswordResetTarget(target || null);
+                setIsPasswordResetOpen(true);
+              }}
             />
           )}
 
@@ -529,6 +825,18 @@ const AppContent: React.FC = () => {
       <CalculationTestModal
         isOpen={showTestModal}
         onClose={() => setShowTestModal(false)}
+      />
+
+      {/* Admin & Employee Password Reset Modal */}
+      <PasswordResetModal
+        isOpen={isPasswordResetOpen}
+        onClose={() => setIsPasswordResetOpen(false)}
+        employees={employees}
+        administrators={administrators}
+        initialTarget={passwordResetTarget}
+        onSaveEmployeeEmail={async (emp, newEmail) => {
+          await handleSaveEmployee({ ...emp, email: newEmail });
+        }}
       />
     </div>
   );

@@ -24,11 +24,15 @@ export const PrintScheduleStandaloneView: React.FC<PrintScheduleStandaloneViewPr
   const days: WorkWeekDay[] = getDaysInWorkWeek(currentWeekFriday);
   const activeEmployees = employees.filter((e) => e.active);
 
-  // Dynamic effective shifts matching each employee's current work part (department & position)
-  const effectiveShifts = shifts.map((s) => {
-    const emp = employees.find((e) => e.employeeId === s.employeeId);
-    return getEffectiveShiftForEmployee(s, emp);
-  });
+  const activeEmpIds = new Set(activeEmployees.map((e) => e.employeeId));
+
+  // Dynamic effective shifts matching each active registered employee's current work part
+  const effectiveShifts = shifts
+    .filter((s) => activeEmpIds.has(s.employeeId))
+    .map((s) => {
+      const emp = employees.find((e) => e.employeeId === s.employeeId);
+      return getEffectiveShiftForEmployee(s, emp);
+    });
 
   const filteredEmployees = activeEmployees.filter((emp) => {
     if (selectedGroup === 'ALL') return true;
@@ -68,7 +72,7 @@ export const PrintScheduleStandaloneView: React.FC<PrintScheduleStandaloneViewPr
       <style>{`
         @page {
           size: portrait;
-          margin: 8mm 6mm;
+          margin: 6mm 5mm;
         }
       `}</style>
       {/* Floating Action Bar (Hidden on print) */}
@@ -167,45 +171,42 @@ export const PrintScheduleStandaloneView: React.FC<PrintScheduleStandaloneViewPr
             return (
               <div key={grp.id} className="border border-slate-300 rounded-lg overflow-hidden page-break-inside-avoid">
                 {/* Group Banner */}
-                <div className="bg-slate-900 text-white px-3 py-1.5 flex items-center justify-between text-xs font-bold">
+                <div className="bg-slate-900 text-white px-3.5 py-2 flex items-center justify-between text-sm font-bold">
                   <span>
                     {grp.name}
                   </span>
-                  <span className="text-[11px] font-normal text-slate-300">
+                  <span className="text-xs font-normal text-slate-300">
                     {language === 'ko' ? '인원' : 'Staff'}: {grpEmps.length}명 • {language === 'ko' ? '소계' : 'Subtotal'}:{' '}
                     {grpHours.toFixed(1)}h {grpOt > 0 ? `(OT: ${grpOt.toFixed(1)}h)` : ''}
                   </span>
                 </div>
 
-                <table className="w-full border-collapse text-xs">
+                <table className="w-full border-collapse text-sm">
                   <thead>
-                    <tr className="bg-slate-100 text-slate-800 font-bold border-b border-slate-300 text-[11px]">
-                      <th className="py-1.5 px-2 text-center w-8 border-r border-slate-300">No</th>
-                      <th className="py-1.5 px-3 text-left w-44 border-r border-slate-300">
+                    <tr className="bg-slate-100 text-slate-800 font-bold border-b border-slate-300 text-sm">
+                      <th className="py-2 px-2 text-center w-9 border-r border-slate-300">No</th>
+                      <th className="py-2 px-3 text-left w-48 border-r border-slate-300">
                         {language === 'ko' ? '직원명 / 직책' : 'Employee / Role'}
                       </th>
                       {days.map((day, idx) => (
                         <th
                           key={day.date}
-                          className={`py-1.5 px-1 text-center border-r border-slate-300 ${
+                          className={`py-2 px-1 text-center border-r border-slate-300 ${
                             idx === 1 || idx === 2 ? 'bg-amber-100/70 text-amber-900' : ''
                           }`}
                         >
-                          <div>{language === 'ko' ? day.dayOfWeekKo : day.dayOfWeek}</div>
-                          <div className="text-[10px] font-normal opacity-80">
+                          <div className="text-sm">{language === 'ko' ? day.dayOfWeekKo : day.dayOfWeek}</div>
+                          <div className="text-xs font-normal opacity-80">
                             {language === 'ko' ? day.displayDateKo : day.displayDate}
                           </div>
                         </th>
                       ))}
-                      <th className="py-1.5 px-2 text-right w-24">
-                        {language === 'ko' ? '주간 합계' : 'Weekly Total'}
-                      </th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200">
                     {grpEmps.length === 0 ? (
                       <tr>
-                        <td colSpan={10} className="py-6 text-center text-slate-400 italic">
+                        <td colSpan={9} className="py-6 text-center text-slate-400 italic text-sm">
                           {language === 'ko' ? '등록된 직원이 없습니다.' : 'No active employees in this group.'}
                         </td>
                       </tr>
@@ -214,16 +215,21 @@ export const PrintScheduleStandaloneView: React.FC<PrintScheduleStandaloneViewPr
                         const empShifts = effectiveShifts.filter((s) => s.employeeId === emp.employeeId);
                         const summary = calculateWeeklyHoursSummary(empShifts);
                         const isOt = summary.totalHours > 40;
+                        const displayName = emp.nickname?.trim() || emp.fullName;
 
                         return (
                           <tr key={emp.employeeId} className={index % 2 === 1 ? 'bg-slate-50/50' : 'bg-white'}>
-                            <td className="py-1.5 px-1 text-center text-slate-500 text-[10px] border-r border-slate-300">
+                            <td className="py-2 px-1 text-center text-slate-500 text-xs border-r border-slate-300">
                               {index + 1}
                             </td>
-                            <td className="py-1.5 px-3 text-left border-r border-slate-300">
-                              <div className="font-bold text-slate-900">{emp.fullName}</div>
-                              <div className="text-[10px] text-slate-500">
-                                {emp.department} • {emp.position}
+                            <td className="py-2 px-3 text-left border-r border-slate-300">
+                              <div className="font-bold text-slate-900 text-[15px]">{displayName}</div>
+                              <div className="text-xs text-slate-500 flex flex-wrap items-center gap-1 mt-0.5">
+                                <span>{emp.department}</span>
+                                <span>•</span>
+                                <span className="font-mono font-bold text-emerald-800">
+                                  {language === 'ko' ? '총 ' : 'Total '}{summary.totalHours.toFixed(1)}h{isOt ? ` (+${summary.overtimeHours.toFixed(1)}h OT)` : ''}
+                                </span>
                               </div>
                             </td>
                             {days.map((day) => {
@@ -232,7 +238,7 @@ export const PrintScheduleStandaloneView: React.FC<PrintScheduleStandaloneViewPr
                                 return (
                                   <td
                                     key={day.date}
-                                    className="py-1 px-1 text-center text-slate-400 text-[10px] bg-slate-50/40 border-r border-slate-300"
+                                    className="py-1.5 px-1 text-center text-slate-400 text-sm font-semibold bg-slate-50/40 border-r border-slate-300"
                                   >
                                     OFF
                                   </td>
@@ -241,34 +247,29 @@ export const PrintScheduleStandaloneView: React.FC<PrintScheduleStandaloneViewPr
                               return (
                                 <td
                                   key={day.date}
-                                  className="py-1 px-1 text-center border-r border-slate-300 leading-tight"
+                                  className="py-1.5 px-1.5 text-center border-r border-slate-300 leading-snug text-sm"
                                 >
-                                  <div className="font-bold text-slate-900 text-[10px]">
-                                    {s.startTime} - {s.endTime}
+                                  {/* Line 1: 시작시간 */}
+                                  <div className="font-bold text-slate-900">
+                                    <span className="text-[11px] text-slate-500 font-normal">{language === 'ko' ? '시작 ' : 'Start '}</span>
+                                    <span className="font-mono text-[15px]">{s.startTime}</span>
                                   </div>
-                                  <div className="text-[9px] text-emerald-700 font-bold">
-                                    {s.hours.toFixed(1)}h{s.isOvernight ? ' 🌙' : ''}
+                                  {/* Line 2: 끝나는 시간 */}
+                                  <div className="font-bold text-slate-900 mt-0.5">
+                                    <span className="text-[11px] text-slate-500 font-normal">{language === 'ko' ? '종료 ' : 'End '}</span>
+                                    <span className="font-mono text-[15px]">{s.endTime}</span>
                                   </div>
-                                  {mode === 'detailed' && s.actualBreakMinutes ? (
-                                    <div className="text-[8px] text-slate-400">
-                                      휴게 {s.actualBreakMinutes}분
-                                    </div>
-                                  ) : null}
+                                  {/* Line 3: 총 근무시간과 휴게 */}
+                                  <div className="text-[13px] text-emerald-700 font-bold mt-0.5">
+                                    {s.hours.toFixed(1)}h <span className="font-normal text-[11px] text-slate-600">({language === 'ko' ? '휴게' : 'Break'} {s.paidBreakMinutes ?? 30}m)</span>
+                                  </div>
+                                  {/* Line 4: Position */}
+                                  <div className="text-[12px] font-semibold text-slate-700 truncate mt-0.5 pt-0.5 border-t border-slate-200">
+                                    {s.position || emp.position}
+                                  </div>
                                 </td>
                               );
                             })}
-                            <td
-                              className={`py-1.5 px-2 text-right font-bold ${
-                                isOt ? 'text-rose-700 bg-rose-50/60' : 'text-emerald-800'
-                              }`}
-                            >
-                              <div>{summary.totalHours.toFixed(1)}h</div>
-                              {isOt && (
-                                <div className="text-[9px] text-rose-600 font-normal">
-                                  OT +{summary.overtimeHours.toFixed(1)}h
-                                </div>
-                              )}
-                            </td>
                           </tr>
                         );
                       })

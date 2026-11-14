@@ -14,11 +14,13 @@ import {
   ShoppingBag,
   Building,
   Store,
+  KeyRound,
 } from 'lucide-react';
 import { useLanguage } from '../context/LanguageContext';
 import { Employee, Shift, PayrollPeriod, StoreSettings, BUSINESS_GROUPS, getBusinessGroup } from '../types';
 import { formatCurrency } from '../utils/calculations';
 import { ActiveTab } from './Sidebar';
+import { PasswordResetInitialTarget } from './PasswordResetModal';
 
 interface DashboardViewProps {
   employees: Employee[];
@@ -28,6 +30,7 @@ interface DashboardViewProps {
   currentWeekFriday: string;
   setActiveTab: (tab: ActiveTab) => void;
   onOpenTestModal: () => void;
+  onOpenPasswordReset?: (target?: PasswordResetInitialTarget) => void;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -38,18 +41,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   currentWeekFriday,
   setActiveTab,
   onOpenTestModal,
+  onOpenPasswordReset,
 }) => {
   const { t, language } = useLanguage();
 
   const activeEmployees = employees.filter((e) => e.active);
+  const activeEmpIds = new Set(activeEmployees.map((e) => e.employeeId));
+  const activeShifts = shifts.filter((s) => activeEmpIds.has(s.employeeId));
   const totalEmployeesCount = employees.length;
+  const inactiveCount = totalEmployeesCount - activeEmployees.length;
 
-  // Aggregate shift hours for this week
-  const totalScheduledHours = shifts.reduce((acc, s) => acc + (Number(s.hours) || 0), 0);
+  // Aggregate shift hours for this week strictly for registered active employees
+  const totalScheduledHours = activeShifts.reduce((acc, s) => acc + (Number(s.hours) || 0), 0);
 
   // Group hours per employee to determine regular vs overtime
   const employeeHoursMap: Record<string, number> = {};
-  shifts.forEach((s) => {
+  activeShifts.forEach((s) => {
     employeeHoursMap[s.employeeId] = (employeeHoursMap[s.employeeId] || 0) + (Number(s.hours) || 0);
   });
 
@@ -86,12 +93,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   });
 
   // Overnight shifts count (crossing midnight)
-  const overnightShifts = shifts.filter((s) => s.isOvernight);
+  const overnightShifts = activeShifts.filter((s) => s.isOvernight);
 
   // Department breakdown
   const departmentHours: Record<string, number> = {};
-  shifts.forEach((s) => {
-    const emp = employees.find((e) => e.employeeId === s.employeeId);
+  activeShifts.forEach((s) => {
+    const emp = activeEmployees.find((e) => e.employeeId === s.employeeId);
     const dept = emp?.department || 'Other';
     departmentHours[dept] = (departmentHours[dept] || 0) + (Number(s.hours) || 0);
   });
@@ -102,9 +109,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       (e) => getBusinessGroup(e.businessGroup || e.groupNumber).id === grp.id
     );
     const activeGroupEmps = groupEmps.filter((e) => e.active);
-    const groupHours = shifts
+    const groupHours = activeShifts
       .filter((s) => {
-        const emp = employees.find((e) => e.employeeId === s.employeeId);
+        const emp = activeEmployees.find((e) => e.employeeId === s.employeeId);
         return getBusinessGroup(s.businessGroup || emp?.businessGroup || emp?.groupNumber).id === grp.id;
       })
       .reduce((acc, s) => acc + (Number(s.hours) || 0), 0);
@@ -162,6 +169,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <DollarSign className="w-4 h-4 text-emerald-400" />
               <span>{t('processPayroll')}</span>
             </button>
+            {onOpenPasswordReset && (
+              <button
+                type="button"
+                onClick={() => onOpenPasswordReset()}
+                className="px-4 py-2.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 text-amber-200 text-xs font-bold border border-amber-500/30 flex items-center space-x-2 transition-all cursor-pointer"
+              >
+                <KeyRound className="w-4 h-4 text-amber-400" />
+                <span>{language === 'ko' ? '비밀번호 재설정' : 'Password Reset'}</span>
+              </button>
+            )}
           </div>
         </div>
 
@@ -185,12 +202,12 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <div className="flex items-baseline space-x-2">
               <span className="text-3xl font-extrabold text-slate-900">{activeEmployees.length}</span>
               <span className="text-xs text-slate-500">
-                / {totalEmployeesCount} {language === 'ko' ? '전체 (퇴사 1명)' : 'total (1 inactive)'}
+                / {totalEmployeesCount} {language === 'ko' ? `전체 (비활성 ${inactiveCount}명)` : `total (${inactiveCount} inactive)`}
               </span>
             </div>
             <div className="mt-2 flex items-center text-xs text-blue-700">
               <span className="font-medium">
-                {language === 'ko' ? '25명 기본 정원 관리' : '25 initial staff supported'}
+                {language === 'ko' ? '등록된 재직 직원 기준 자동 집계' : 'Synced with registered active staff'}
               </span>
             </div>
           </div>
@@ -404,7 +421,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
 
           {/* Quick Action Grid */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
             <button
               onClick={() => setActiveTab('schedule')}
               className="p-4 rounded-xl bg-white border border-slate-200 hover:border-emerald-400 hover:shadow-md transition-all text-left group"
@@ -443,6 +460,26 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 {language === 'ko' ? '직원별 급여명세서 및 CSV 출력' : 'Printable vouchers & Excel CSV'}
               </p>
             </button>
+
+            {onOpenPasswordReset && (
+              <button
+                type="button"
+                onClick={() => onOpenPasswordReset()}
+                className="p-4 rounded-xl bg-white border border-slate-200 hover:border-amber-400 hover:shadow-md transition-all text-left group cursor-pointer"
+              >
+                <div className="w-8 h-8 rounded-lg bg-amber-50 text-amber-600 flex items-center justify-center mb-2 group-hover:bg-amber-600 group-hover:text-white transition-colors">
+                  <KeyRound className="w-4 h-4" />
+                </div>
+                <p className="text-sm font-bold text-slate-900">
+                  {language === 'ko' ? '계정 비밀번호 재설정' : 'Password Reset'}
+                </p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {language === 'ko'
+                    ? '직원/관리자 임시 인증코드 발급'
+                    : 'Reset staff/admin via email code'}
+                </p>
+              </button>
+            )}
           </div>
         </div>
 

@@ -18,9 +18,15 @@ service cloud.firestore {
 
     // Runtime initial admin email from environment / setup
     function isSuperUser() {
-      return isSignedIn() && (
-        request.auth.token.email == 'jaraman1215@gmail.com'
-      );
+      return isSignedIn() &&
+        request.auth.token.email == 'jaraman1215@gmail.com' &&
+        request.auth.token.email_verified == true;
+    }
+
+    function isSuperAdminRole() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/administrators/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/administrators/$(request.auth.uid)).data.role == 'super_admin';
     }
 
     function isAdmin() {
@@ -32,12 +38,18 @@ service cloud.firestore {
 
     // Administrators collection
     match /administrators/{adminId} {
-      allow read: if isAdmin();
-      allow create: if isSignedIn() && isValidId(adminId) && (isSuperUser() || isAdmin()) &&
+      allow get: if isAdmin() || (isSignedIn() && (request.auth.uid == adminId || (resource != null && resource.data.email == request.auth.token.email)));
+      allow list: if isAdmin() || (isSignedIn() && resource.data.email == request.auth.token.email);
+      allow create: if isSignedIn() && isValidId(adminId) && (adminId == request.auth.uid || isAdmin()) &&
+        request.resource.data.uid is string &&
+        request.resource.data.uid.size() <= 128 &&
         request.resource.data.email is string &&
+        request.resource.data.email.size() <= 128 &&
         request.resource.data.role in ['super_admin', 'admin', 'manager'];
-      allow update: if isAdmin() && isValidId(adminId);
-      allow delete: if isSuperUser() && isValidId(adminId) && adminId != request.auth.uid;
+      allow update: if isAdmin() && isValidId(adminId) &&
+        request.resource.data.role in ['super_admin', 'admin', 'manager'];
+      allow delete: if ((isSuperUser() || isSuperAdminRole()) && isValidId(adminId) && adminId != request.auth.uid) ||
+        (isAdmin() && isValidId(adminId) && resource != null && resource.data.email == request.auth.token.email && adminId != request.auth.uid);
     }
 
     // Employees collection
@@ -77,10 +89,19 @@ service cloud.firestore {
       allow create, update, delete: if isAdmin() && isValidId(recordId);
     }
 
-    // Global Store Settings
+    // Global Store Settings (6-digit workspacePasscode editable ONLY by jaraman1215@gmail.com)
     match /settings/{settingId} {
       allow read: if isAdmin();
-      allow create, update: if isAdmin() && isValidId(settingId);
+      allow create: if isAdmin() && isValidId(settingId) &&
+        (!('workspacePasscode' in request.resource.data) ||
+          (request.resource.data.workspacePasscode is string &&
+            request.resource.data.workspacePasscode.matches('^[0-9]{6}$') &&
+            (isSuperUser() || request.resource.data.workspacePasscode == '123456')));
+      allow update: if isAdmin() && isValidId(settingId) &&
+        (isSuperUser() || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['workspacePasscode'])) &&
+        (!('workspacePasscode' in request.resource.data) ||
+          (request.resource.data.workspacePasscode is string &&
+            request.resource.data.workspacePasscode.matches('^[0-9]{6}$')));
       allow delete: if false;
     }
 
@@ -91,6 +112,55 @@ service cloud.firestore {
         request.resource.data.action is string &&
         request.resource.data.performedByEmail is string;
       allow update, delete: if false;
+    }
+
+    // Validation helper for Password Reset Requests
+    function isValidPasswordResetRequest(data) {
+      return data.keys().hasAll([
+          'id', 'targetType', 'targetName', 'email', 'codeHash',
+          'firebaseEmailSent', 'status', 'expiresAt', 'createdAt', 'requestedBy'
+        ]) &&
+        data.keys().hasOnly([
+          'id', 'targetType', 'targetUid', 'targetName', 'email', 'loginId',
+          'codeHash', 'firebaseEmailSent', 'status', 'expiresAt', 'createdAt',
+          'requestedBy', 'verifiedAt', 'completedAt'
+        ]) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.targetType in ['employee', 'admin'] &&
+        data.targetName is string && data.targetName.size() <= 128 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 128 &&
+        data.codeHash is string && data.codeHash.size() == 64 &&
+        data.firebaseEmailSent is bool &&
+        data.status in ['pending', 'verified', 'completed', 'expired', 'revoked'] &&
+        data.expiresAt is string && data.expiresAt.size() <= 64 &&
+        data.createdAt is string && data.createdAt.size() <= 64 &&
+        data.requestedBy is string && data.requestedBy.size() <= 128 &&
+        (!('targetUid' in data) || (data.targetUid is string && data.targetUid.size() <= 128)) &&
+        (!('loginId' in data) || (data.loginId is string && data.loginId.size() <= 128)) &&
+        (!('verifiedAt' in data) || (data.verifiedAt is string && data.verifiedAt.size() <= 64)) &&
+        (!('completedAt' in data) || (data.completedAt is string && data.completedAt.size() <= 64));
+    }
+
+    // Password reset verification requests (admin-managed, hashed code only)
+    match /passwordResetRequests/{requestId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() &&
+        isValidId(requestId) &&
+        isValidPasswordResetRequest(request.resource.data) &&
+        request.resource.data.id == requestId &&
+        request.resource.data.status == 'pending';
+      allow update: if isAdmin() &&
+        isValidId(requestId) &&
+        isValidPasswordResetRequest(request.resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'verifiedAt', 'completedAt', 'firebaseEmailSent']) &&
+        request.resource.data.id == resource.data.id &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.codeHash == resource.data.codeHash &&
+        request.resource.data.targetType == resource.data.targetType &&
+        request.resource.data.requestedBy == resource.data.requestedBy &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.expiresAt == resource.data.expiresAt;
+      allow delete: if false;
     }
   }
 }

@@ -86,14 +86,20 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
 
   const [selectedGroup, setSelectedGroup] = useState<string>('ALL');
 
-  // Filter records by business group and ensure only working employees with hours/pay are displayed
-  const displayedRecords = payrollRecords.filter((r) => {
-    const hasWork =
+  // Strict active registered employees filter
+  const activeEmpIds = new Set(employees.filter((e) => e.active).map((e) => e.employeeId));
+  const validRecords = payrollRecords.filter((r) => {
+    if (!activeEmpIds.has(r.employeeId)) return false;
+    return (
       r.regularHours > 0 ||
       r.overtimeHours > 0 ||
       r.grossPay > 0 ||
-      (r.adjustments && r.adjustments.length > 0);
-    if (!hasWork) return false;
+      (r.adjustments && r.adjustments.length > 0)
+    );
+  });
+
+  // Filter records by business group and ensure only registered active working employees are displayed
+  const displayedRecords = validRecords.filter((r) => {
     if (selectedGroup === 'ALL') return true;
     const emp = employees.find((e) => e.employeeId === r.employeeId);
     const grp = getBusinessGroup(r.businessGroup || r.groupNumber || emp?.businessGroup || emp?.groupNumber);
@@ -369,12 +375,55 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
   const [cashHoursStr, setCashHoursStr] = useState<string>('0');
   const [checkAmountStr, setCheckAmountStr] = useState<string>('');
   const [cashAmountStr, setCashAmountStr] = useState<string>('');
+  const [lastEditedSplitSide, setLastEditedSplitSide] = useState<'check' | 'cash'>('check');
   const [isManualTax, setIsManualTax] = useState<boolean>(false);
   const [manualFedStr, setManualFedStr] = useState<string>('');
   const [manualVaStr, setManualVaStr] = useState<string>('');
   const [manualSsStr, setManualSsStr] = useState<string>('');
   const [manualMedStr, setManualMedStr] = useState<string>('');
   const [payModalError, setPayModalError] = useState<string | null>(null);
+
+  const computeLiveModalNetPay = (
+    rec: PayrollRecord,
+    manualEnabled: boolean,
+    fedStr: string,
+    vaStr: string,
+    ssStr: string,
+    medStr: string
+  ): number => {
+    const baseNonTax = (rec.insuranceDeduction || 0) + (rec.otherDeductions || 0);
+    const taxes = manualEnabled
+      ? (parseFloat(fedStr) || 0) +
+        (parseFloat(vaStr) || 0) +
+        (parseFloat(ssStr) || 0) +
+        (parseFloat(medStr) || 0)
+      : rec.totalTaxes;
+    return Math.max(0, Math.round((rec.grossPay - taxes - baseNonTax) * 100) / 100);
+  };
+
+  const syncAmountsWithNetPay = (
+    newNet: number,
+    method: PaymentMethod,
+    anchorSide: 'check' | 'cash',
+    currentCheckStr: string,
+    currentCashStr: string
+  ) => {
+    if (method === 'ALL_CHECK') {
+      setCheckAmountStr(newNet.toFixed(2));
+      setCashAmountStr('0.00');
+    } else if (method === 'ALL_CASH') {
+      setCheckAmountStr('0.00');
+      setCashAmountStr(newNet.toFixed(2));
+    } else if (anchorSide === 'cash') {
+      const csh = Math.max(0, Math.min(newNet, parseFloat(currentCashStr) || 0));
+      setCashAmountStr(csh.toFixed(2));
+      setCheckAmountStr(Math.max(0, Math.round((newNet - csh) * 100) / 100).toFixed(2));
+    } else {
+      const chk = Math.max(0, Math.min(newNet, parseFloat(currentCheckStr) || 0));
+      setCheckAmountStr(chk.toFixed(2));
+      setCashAmountStr(Math.max(0, Math.round((newNet - chk) * 100) / 100).toFixed(2));
+    }
+  };
 
   const handleOpenPaymentModal = (record: PayrollRecord) => {
     setPaymentTargetRecord(record);
@@ -384,8 +433,18 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
     const tHrs = record.taxableHours !== undefined ? record.taxableHours : (method === 'ALL_CASH' ? 0 : Math.min(40, totalHrs));
     setTaxableHoursStr(tHrs.toString());
     setCashHoursStr((record.cashHours !== undefined ? record.cashHours : Math.max(0, totalHrs - tHrs)).toString());
-    setCheckAmountStr((record.checkAmount !== undefined ? record.checkAmount : (method === 'ALL_CASH' ? 0 : record.netPay)).toFixed(2));
-    setCashAmountStr((record.cashAmount !== undefined ? record.cashAmount : (method === 'ALL_CHECK' ? 0 : (method === 'ALL_CASH' ? record.netPay : 0))).toFixed(2));
+    const initCheck = record.checkAmount !== undefined ? record.checkAmount : (method === 'ALL_CASH' ? 0 : record.netPay);
+    const initCash =
+      record.cashAmount !== undefined
+        ? record.cashAmount
+        : method === 'ALL_CHECK'
+        ? 0
+        : method === 'ALL_CASH'
+        ? record.netPay
+        : Math.max(0, Math.round((record.netPay - initCheck) * 100) / 100);
+    setCheckAmountStr(initCheck.toFixed(2));
+    setCashAmountStr(initCash.toFixed(2));
+    setLastEditedSplitSide('check');
     setIsManualTax(record.isManualTax ?? false);
     setManualFedStr((record.manualFederalWithholding !== undefined ? record.manualFederalWithholding : record.federalWithholding).toFixed(2));
     setManualVaStr((record.manualVaWithholding !== undefined ? record.manualVaWithholding : record.vaWithholding).toFixed(2));
@@ -398,10 +457,30 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
     e.preventDefault();
     if (!paymentTargetRecord || !onSavePaymentAndTaxes) return;
 
+    const liveNet = computeLiveModalNetPay(
+      paymentTargetRecord,
+      isManualTax,
+      manualFedStr,
+      manualVaStr,
+      manualSsStr,
+      manualMedStr
+    );
+
     const tHrs = parseFloat(taxableHoursStr) || 0;
     const cHrs = parseFloat(cashHoursStr) || 0;
-    const chkAmt = parseFloat(checkAmountStr) || 0;
-    const cshAmt = parseFloat(cashAmountStr) || 0;
+    let chkAmt = Math.max(0, Math.min(liveNet, parseFloat(checkAmountStr) || 0));
+    let cshAmt = Math.max(0, Math.round((liveNet - chkAmt) * 100) / 100);
+    if (lastEditedSplitSide === 'cash' && payMethod === 'SPLIT') {
+      cshAmt = Math.max(0, Math.min(liveNet, parseFloat(cashAmountStr) || 0));
+      chkAmt = Math.max(0, Math.round((liveNet - cshAmt) * 100) / 100);
+    }
+    if (payMethod === 'ALL_CHECK') {
+      chkAmt = liveNet;
+      cshAmt = 0;
+    } else if (payMethod === 'ALL_CASH') {
+      chkAmt = 0;
+      cshAmt = liveNet;
+    }
 
     const fed = parseFloat(manualFedStr) || 0;
     const va = parseFloat(manualVaStr) || 0;
@@ -430,9 +509,9 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
     }
   };
 
-  // CSV Export for payroll
+  // CSV Export for payroll (strictly registered active employees)
   const handleExportCsv = () => {
-    if (payrollRecords.length === 0) return;
+    if (displayedRecords.length === 0) return;
 
     const headers = [
       'Pay Period Start (Friday)',
@@ -457,7 +536,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
       'Is Adjusted',
     ];
 
-    const rows = payrollRecords.map((r) => [
+    const rows = displayedRecords.map((r) => [
       payrollPeriod?.weekStartDate || currentWeekFriday,
       payrollPeriod?.weekEndDate || '',
       r.employeeId,
@@ -490,11 +569,11 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
     document.body.removeChild(link);
   };
 
-  // Summary totals for current period
-  const totalGross = payrollRecords.reduce((sum, r) => sum + r.grossPay, 0);
-  const totalTaxes = payrollRecords.reduce((sum, r) => sum + r.totalTaxes, 0);
-  const totalNet = payrollRecords.reduce((sum, r) => sum + r.netPay, 0);
-  const totalOtHours = payrollRecords.reduce((sum, r) => sum + r.overtimeHours, 0);
+  // Summary totals strictly for registered active employees (respecting group filter)
+  const totalGross = displayedRecords.reduce((sum, r) => sum + r.grossPay, 0);
+  const totalTaxes = displayedRecords.reduce((sum, r) => sum + r.totalTaxes, 0);
+  const totalNet = displayedRecords.reduce((sum, r) => sum + r.netPay, 0);
+  const totalOtHours = displayedRecords.reduce((sum, r) => sum + r.overtimeHours, 0);
 
   return (
     <div className="space-y-6">
@@ -553,7 +632,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
             <span>{language === 'ko' ? '세율 안내' : 'Tax Info'}</span>
           </button>
 
-          {payrollRecords.length > 0 && !isFinalized && (
+          {validRecords.length > 0 && !isFinalized && (
             <button
               onClick={() => {
                 setShowBatchTaxModal(true);
@@ -576,23 +655,23 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
               className="bg-transparent text-xs font-bold text-slate-800 focus:outline-hidden cursor-pointer"
             >
               <option value="ALL">
-                {language === 'ko' ? `전체 사업장/그룹 (${payrollRecords.length}건)` : `All Business Groups (${payrollRecords.length})`}
+                {language === 'ko' ? `전체 사업장/그룹 (${validRecords.length}건)` : `All Business Groups (${validRecords.length})`}
               </option>
               {BUSINESS_GROUPS.map((grp) => {
-                const count = payrollRecords.filter((r) => {
+                const count = validRecords.filter((r) => {
                   const emp = employees.find((e) => e.employeeId === r.employeeId);
                   return getBusinessGroup(r.businessGroup || r.groupNumber || emp?.businessGroup || emp?.groupNumber).id === grp.id;
                 }).length;
                 return (
                   <option key={grp.id} value={grp.id}>
-                    {grp.name} ({count}건)
+                    {grp.name} ({count}{language === 'ko' ? '건' : ''})
                   </option>
                 );
               })}
             </select>
           </div>
 
-          {payrollRecords.length > 0 && (
+          {displayedRecords.length > 0 && (
             <button
               onClick={handleExportCsv}
               className="px-3 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-bold shadow-xs flex items-center space-x-1.5 cursor-pointer"
@@ -618,7 +697,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                 </span>
               </button>
 
-              {payrollRecords.length > 0 && (
+              {validRecords.length > 0 && (
                 <button
                   onClick={() => setShowFinalizeModal(true)}
                   className="px-3.5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 cursor-pointer"
@@ -676,12 +755,12 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
       )}
 
       {/* Summary KPI Banner */}
-      {payrollRecords.length > 0 && (
+      {displayedRecords.length > 0 && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-white p-4 rounded-2xl border border-slate-200 shadow-xs">
           <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
             <span className="text-[10px] uppercase font-bold text-slate-500 block">Total Gross Payroll</span>
             <span className="text-lg font-black text-slate-900">{formatCurrency(totalGross)}</span>
-            <span className="text-[10px] text-slate-400 block mt-0.5">{payrollRecords.length} staff processed</span>
+            <span className="text-[10px] text-slate-400 block mt-0.5">{displayedRecords.length} staff processed</span>
           </div>
 
           <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
@@ -708,7 +787,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
 
       {/* Main Payroll Table */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-        {payrollRecords.length > 0 ? (
+        {displayedRecords.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse text-xs">
               <thead>
@@ -1604,7 +1683,40 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
       )}
 
       {/* Payment Method & Manual Tax Deduction Modal (Items 4 & 5) */}
-      {paymentTargetRecord && (
+      {paymentTargetRecord && (() => {
+        const liveModalNetPay = computeLiveModalNetPay(
+          paymentTargetRecord,
+          isManualTax,
+          manualFedStr,
+          manualVaStr,
+          manualSsStr,
+          manualMedStr
+        );
+
+        const handleManualTaxChange = (
+          field: 'fed' | 'va' | 'ss' | 'med',
+          val: string
+        ) => {
+          const nextFed = field === 'fed' ? val : manualFedStr;
+          const nextVa = field === 'va' ? val : manualVaStr;
+          const nextSs = field === 'ss' ? val : manualSsStr;
+          const nextMed = field === 'med' ? val : manualMedStr;
+          if (field === 'fed') setManualFedStr(val);
+          if (field === 'va') setManualVaStr(val);
+          if (field === 'ss') setManualSsStr(val);
+          if (field === 'med') setManualMedStr(val);
+          const nextNet = computeLiveModalNetPay(
+            paymentTargetRecord,
+            isManualTax,
+            nextFed,
+            nextVa,
+            nextSs,
+            nextMed
+          );
+          syncAmountsWithNetPay(nextNet, payMethod, lastEditedSplitSide, checkAmountStr, cashAmountStr);
+        };
+
+        return (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
           <div className="bg-white rounded-2xl shadow-2xl max-w-xl w-full p-6 border border-slate-200 animate-in fade-in zoom-in-95 duration-150 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-4">
@@ -1617,7 +1729,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                     {language === 'ko' ? '급여 지급 방식 및 세금공제 직접 설정' : 'Payment Method & Tax Deduction Settings'}
                   </h3>
                   <p className="text-xs text-slate-500">
-                    {paymentTargetRecord.employeeName} ({paymentTargetRecord.employeeId}) • 시급: ${paymentTargetRecord.hourlyWage.toFixed(2)}/h • 총근무: {(paymentTargetRecord.regularHours + paymentTargetRecord.overtimeHours).toFixed(1)}시간
+                    {paymentTargetRecord.employeeName} ({paymentTargetRecord.employeeId}) • {language === 'ko' ? '시급: ' : 'Wage: '}${paymentTargetRecord.hourlyWage.toFixed(2)}/h • {language === 'ko' ? '총근무: ' : 'Total: '}{(paymentTargetRecord.regularHours + paymentTargetRecord.overtimeHours).toFixed(1)}{language === 'ko' ? '시간' : ' hrs'}
                   </p>
                 </div>
               </div>
@@ -1636,6 +1748,23 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                 </div>
               )}
 
+              {/* Live Net Pay Banner */}
+              <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center justify-between">
+                <div>
+                  <span className="text-[11px] font-bold text-emerald-800 block">
+                    {language === 'ko' ? '실지급 총액 (Check + Cash 합계 기준)' : 'Total Net Payroll (Check + Cash Total)'}
+                  </span>
+                  <span className="text-[10px] text-emerald-700">
+                    {language === 'ko'
+                      ? 'Check 또는 Cash 한쪽 금액을 입력하면 나머지 금액이 자동 계산됩니다.'
+                      : 'Enter either Check or Cash amount — the counterpart updates automatically.'}
+                  </span>
+                </div>
+                <span className="text-lg font-black font-mono text-emerald-900">
+                  {formatCurrency(liveModalNetPay)}
+                </span>
+              </div>
+
               {/* 1. Payment Method Selection (Item 5) */}
               <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
                 <label className="font-bold text-slate-900 block text-xs">
@@ -1649,8 +1778,9 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                       const total = paymentTargetRecord.regularHours + paymentTargetRecord.overtimeHours;
                       setTaxableHoursStr(total.toString());
                       setCashHoursStr('0');
-                      setCheckAmountStr(paymentTargetRecord.netPay.toFixed(2));
+                      setCheckAmountStr(liveModalNetPay.toFixed(2));
                       setCashAmountStr('0.00');
+                      setLastEditedSplitSide('check');
                     }}
                     className={`p-2.5 rounded-xl border text-center transition-all cursor-pointer ${
                       payMethod === 'ALL_CHECK'
@@ -1670,7 +1800,8 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                       setTaxableHoursStr('0');
                       setCashHoursStr(total.toString());
                       setCheckAmountStr('0.00');
-                      setCashAmountStr(paymentTargetRecord.netPay.toFixed(2));
+                      setCashAmountStr(liveModalNetPay.toFixed(2));
+                      setLastEditedSplitSide('cash');
                     }}
                     className={`p-2.5 rounded-xl border text-center transition-all cursor-pointer ${
                       payMethod === 'ALL_CASH'
@@ -1690,6 +1821,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                       const standardTaxable = Math.min(40, total);
                       setTaxableHoursStr(standardTaxable.toString());
                       setCashHoursStr(Math.max(0, total - standardTaxable).toString());
+                      syncAmountsWithNetPay(liveModalNetPay, 'SPLIT', lastEditedSplitSide, checkAmountStr, cashAmountStr);
                     }}
                     className={`p-2.5 rounded-xl border text-center transition-all cursor-pointer ${
                       payMethod === 'SPLIT'
@@ -1747,7 +1879,13 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                       step="any"
                       min="0"
                       value={cashHoursStr}
-                      onChange={(e) => setCashHoursStr(e.target.value)}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setCashHoursStr(val);
+                        const num = parseFloat(val) || 0;
+                        const total = paymentTargetRecord.regularHours + paymentTargetRecord.overtimeHours;
+                        setTaxableHoursStr(Math.max(0, total - num).toFixed(1));
+                      }}
                       className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white font-mono font-bold text-slate-900 focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
                     />
                     <p className="text-[10px] text-slate-500 mt-0.5">
@@ -1767,8 +1905,18 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                         type="number"
                         step="any"
                         min="0"
+                        max={liveModalNetPay}
                         value={checkAmountStr}
-                        onChange={(e) => setCheckAmountStr(e.target.value)}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setCheckAmountStr(val);
+                          setLastEditedSplitSide('check');
+                          const raw = parseFloat(val);
+                          const chk = isNaN(raw) ? 0 : Math.max(0, Math.min(liveModalNetPay, raw));
+                          const autoCash = Math.max(0, Math.round((liveModalNetPay - chk) * 100) / 100);
+                          setCashAmountStr(autoCash.toFixed(2));
+                          if (payMethod !== 'SPLIT') setPayMethod('SPLIT');
+                        }}
                         className="w-full pl-7 pr-3 py-2 rounded-xl border border-slate-200 bg-white font-mono font-bold text-slate-900 focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500"
                       />
                     </div>
@@ -1784,8 +1932,18 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                         type="number"
                         step="any"
                         min="0"
+                        max={liveModalNetPay}
                         value={cashAmountStr}
-                        onChange={(e) => setCashAmountStr(e.target.value)}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setCashAmountStr(val);
+                          setLastEditedSplitSide('cash');
+                          const raw = parseFloat(val);
+                          const csh = isNaN(raw) ? 0 : Math.max(0, Math.min(liveModalNetPay, raw));
+                          const autoCheck = Math.max(0, Math.round((liveModalNetPay - csh) * 100) / 100);
+                          setCheckAmountStr(autoCheck.toFixed(2));
+                          if (payMethod !== 'SPLIT') setPayMethod('SPLIT');
+                        }}
                         className="w-full pl-7 pr-3 py-2 rounded-xl border border-slate-200 bg-white font-mono font-bold text-amber-800 focus:ring-2 focus:ring-amber-500/20 focus:border-amber-500"
                       />
                     </div>
@@ -1800,7 +1958,19 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                     <input
                       type="checkbox"
                       checked={isManualTax}
-                      onChange={(e) => setIsManualTax(e.target.checked)}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setIsManualTax(checked);
+                        const nextNet = computeLiveModalNetPay(
+                          paymentTargetRecord,
+                          checked,
+                          manualFedStr,
+                          manualVaStr,
+                          manualSsStr,
+                          manualMedStr
+                        );
+                        syncAmountsWithNetPay(nextNet, payMethod, lastEditedSplitSide, checkAmountStr, cashAmountStr);
+                      }}
                       className="rounded text-purple-600 focus:ring-purple-500 w-4 h-4 cursor-pointer"
                     />
                     <span>{language === 'ko' ? '3. 세금 공제액 직접 수기 입력 (Manual Tax Override)' : '3. Direct Manual Tax Deductions'}</span>
@@ -1814,7 +1984,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                   <div className="grid grid-cols-2 gap-3 p-3 bg-purple-50/50 rounded-xl border border-purple-200">
                     <div>
                       <label className="text-[10px] font-bold text-slate-700 block mb-1">
-                        연방 소득세 (Federal Tax)
+                        {language === 'ko' ? '연방 소득세 (Federal Tax)' : 'Federal Income Tax'}
                       </label>
                       <div className="relative">
                         <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
@@ -1823,7 +1993,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                           step="any"
                           min="0"
                           value={manualFedStr}
-                          onChange={(e) => setManualFedStr(e.target.value)}
+                          onChange={(e) => handleManualTaxChange('fed', e.target.value)}
                           className="w-full pl-6 pr-2 py-1.5 rounded-lg border border-slate-200 bg-white font-mono font-bold text-xs"
                         />
                       </div>
@@ -1831,7 +2001,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
 
                     <div>
                       <label className="text-[10px] font-bold text-slate-700 block mb-1">
-                        버지니아 주세 (Virginia State Tax)
+                        {language === 'ko' ? '버지니아 주세 (Virginia State Tax)' : 'Virginia State Tax'}
                       </label>
                       <div className="relative">
                         <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
@@ -1840,7 +2010,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                           step="any"
                           min="0"
                           value={manualVaStr}
-                          onChange={(e) => setManualVaStr(e.target.value)}
+                          onChange={(e) => handleManualTaxChange('va', e.target.value)}
                           className="w-full pl-6 pr-2 py-1.5 rounded-lg border border-slate-200 bg-white font-mono font-bold text-xs"
                         />
                       </div>
@@ -1848,7 +2018,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
 
                     <div>
                       <label className="text-[10px] font-bold text-slate-700 block mb-1">
-                        사회보장세 (Social Security 6.2%)
+                        {language === 'ko' ? '사회보장세 (Social Security 6.2%)' : 'Social Security (6.2%)'}
                       </label>
                       <div className="relative">
                         <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
@@ -1857,7 +2027,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                           step="any"
                           min="0"
                           value={manualSsStr}
-                          onChange={(e) => setManualSsStr(e.target.value)}
+                          onChange={(e) => handleManualTaxChange('ss', e.target.value)}
                           className="w-full pl-6 pr-2 py-1.5 rounded-lg border border-slate-200 bg-white font-mono font-bold text-xs"
                         />
                       </div>
@@ -1865,7 +2035,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
 
                     <div>
                       <label className="text-[10px] font-bold text-slate-700 block mb-1">
-                        메디케어 (Medicare 1.45%)
+                        {language === 'ko' ? '메디케어 (Medicare 1.45%)' : 'Medicare (1.45%)'}
                       </label>
                       <div className="relative">
                         <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold">$</span>
@@ -1874,7 +2044,7 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
                           step="any"
                           min="0"
                           value={manualMedStr}
-                          onChange={(e) => setManualMedStr(e.target.value)}
+                          onChange={(e) => handleManualTaxChange('med', e.target.value)}
                           className="w-full pl-6 pr-2 py-1.5 rounded-lg border border-slate-200 bg-white font-mono font-bold text-xs"
                         />
                       </div>
@@ -1906,7 +2076,8 @@ export const PayrollView: React.FC<PayrollViewProps> = ({
             </form>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* Batch Withholding Tax Modal */}
       {showBatchTaxModal && (

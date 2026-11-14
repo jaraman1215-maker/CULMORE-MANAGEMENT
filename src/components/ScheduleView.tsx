@@ -22,8 +22,12 @@ import {
   FileText,
   Eye,
   ExternalLink,
+  HardDriveDownload,
+  Upload,
+  History,
+  FolderOpen,
 } from 'lucide-react';
-import { Employee, Shift, WorkWeekDay, BUSINESS_GROUPS, getBusinessGroup } from '../types';
+import { Employee, Shift, WorkWeekDay, BUSINESS_GROUPS, getBusinessGroup, ScheduleBackupFile } from '../types';
 import { useLanguage } from '../context/LanguageContext';
 import {
   getDaysInWorkWeek,
@@ -41,6 +45,14 @@ import {
   getEffectiveShiftForEmployee,
 } from '../utils/calculations';
 import { CopyScheduleOptions } from '../firebase/dataService';
+import {
+  loadScheduleAutoBackups,
+  deleteScheduleAutoBackup,
+  downloadScheduleBackupToComputer,
+  downloadJsonFile,
+  parseScheduleBackupJson,
+  formatTimestampForFilename,
+} from '../utils/backupUtils';
 
 interface ScheduleViewProps {
   currentWeekFriday: string;
@@ -50,6 +62,11 @@ interface ScheduleViewProps {
   onSaveShift: (shift: Shift) => Promise<void>;
   onDeleteShift: (shiftId: string) => Promise<void>;
   onCopyFromPreviousWeek: (sourceFridayYmd: string, targetFridayYmd: string, options?: CopyScheduleOptions) => Promise<void>;
+  onRestoreScheduleBackup?: (
+    targetWeekFriday: string,
+    backupShifts: Shift[],
+    mode: 'merge' | 'overwrite'
+  ) => Promise<number>;
 }
 
 export const ScheduleView: React.FC<ScheduleViewProps> = ({
@@ -60,24 +77,38 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
   onSaveShift,
   onDeleteShift,
   onCopyFromPreviousWeek,
+  onRestoreScheduleBackup,
 }) => {
   const { t, language } = useLanguage();
 
   const days: WorkWeekDay[] = getDaysInWorkWeek(currentWeekFriday);
   const activeEmployees = employees.filter((e) => e.active);
   const [selectedGroup, setSelectedGroup] = useState<string>('ALL');
+  const [selectedCulmorePart, setSelectedCulmorePart] = useState<string>('ALL');
 
-  // Dynamic effective shifts matching each employee's current work part (department & position)
-  const effectiveShifts = shifts.map((s) => {
-    const emp = employees.find((e) => e.employeeId === s.employeeId);
-    return getEffectiveShiftForEmployee(s, emp);
-  });
+  const activeEmpIds = new Set(activeEmployees.map((e) => e.employeeId));
 
-  // Filtered active employees by business group
+  // Dynamic effective shifts matching each active registered employee's current work part (department & position)
+  const effectiveShifts = shifts
+    .filter((s) => activeEmpIds.has(s.employeeId))
+    .map((s) => {
+      const emp = employees.find((e) => e.employeeId === s.employeeId);
+      return getEffectiveShiftForEmployee(s, emp);
+    });
+
+  // Filtered active employees by business group and Culmore part
   const displayedEmployees = activeEmployees.filter((emp) => {
-    if (selectedGroup === 'ALL') return true;
-    const grp = getBusinessGroup(emp.businessGroup || emp.groupNumber);
-    return grp.id === selectedGroup;
+    if (selectedGroup !== 'ALL') {
+      const grp = getBusinessGroup(emp.businessGroup || emp.groupNumber);
+      if (grp.id !== selectedGroup) return false;
+    }
+    if (selectedGroup === 'group_2' && selectedCulmorePart !== 'ALL') {
+      if (selectedCulmorePart === 'Kitchen & Cooking') {
+        return emp.department === 'Kitchen & Cooking' || emp.department === 'Deli & Prepared Foods';
+      }
+      return emp.department === selectedCulmorePart;
+    }
+    return true;
   });
 
   // Modal state
@@ -99,9 +130,82 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
   const [printTargetGroup, setPrintTargetGroup] = useState<string>('ALL');
   const [printDetailMode, setPrintDetailMode] = useState<'compact' | 'detailed'>('compact');
 
+  // Backup & Restore Modal state
+  const [isBackupModalOpen, setIsBackupModalOpen] = useState(false);
+  const [autoBackups, setAutoBackups] = useState<ScheduleBackupFile[]>(() => loadScheduleAutoBackups());
+  const [restoreMode, setRestoreMode] = useState<'overwrite' | 'merge'>('overwrite');
+  const [uploadedBackup, setUploadedBackup] = useState<ScheduleBackupFile | null>(null);
+  const [backupFeedback, setBackupFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [isRestoringBackup, setIsRestoringBackup] = useState(false);
+
+  const refreshAutoBackups = () => {
+    setAutoBackups(loadScheduleAutoBackups());
+  };
+
+  const handleQuickSaveScheduleBackup = () => {
+    downloadScheduleBackupToComputer(currentWeekFriday, effectiveShifts, 'manual');
+    refreshAutoBackups();
+    setBackupFeedback({
+      type: 'success',
+      text:
+        language === 'ko'
+          ? `이번 주(${currentWeekFriday}) 스케줄 백업 파일(.json)이 컴퓨터에 저장되었습니다.`
+          : `Schedule backup (.json) saved to your computer for ${currentWeekFriday}.`,
+    });
+  };
+
+  const handleUploadBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = parseScheduleBackupJson(text);
+      setUploadedBackup(parsed);
+      setBackupFeedback(null);
+    } catch (err) {
+      setUploadedBackup(null);
+      setBackupFeedback({
+        type: 'error',
+        text:
+          language === 'ko'
+            ? '올바른 스케줄 백업 파일(.json)이 아닙니다.'
+            : err instanceof Error
+            ? err.message
+            : 'Invalid schedule backup file.',
+      });
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const handleApplyBackup = async (backup: ScheduleBackupFile) => {
+    if (!onRestoreScheduleBackup) return;
+    try {
+      setIsRestoringBackup(true);
+      const appliedCount = await onRestoreScheduleBackup(currentWeekFriday, backup.shifts, restoreMode);
+      refreshAutoBackups();
+      setBackupFeedback({
+        type: 'success',
+        text:
+          language === 'ko'
+            ? `백업 스케줄 적용 완료! (${appliedCount}건의 근무가 ${currentWeekFriday} 주간에 반영되었습니다.)`
+            : `Backup applied cleanly! (${appliedCount} shifts restored to ${currentWeekFriday}.)`,
+      });
+      setUploadedBackup(null);
+    } catch (err) {
+      setBackupFeedback({
+        type: 'error',
+        text: err instanceof Error ? err.message : 'Failed to apply backup.',
+      });
+    } finally {
+      setIsRestoringBackup(false);
+    }
+  };
+
   // Form inputs
   const [startTime, setStartTime] = useState('08:00');
   const [endTime, setEndTime] = useState('16:30');
+  const [shiftPosition, setShiftPosition] = useState('');
   const [breakMinutes, setBreakMinutes] = useState(30);
   const [notes, setNotes] = useState('');
   const [isCopyingWeek, setIsCopyingWeek] = useState(false);
@@ -138,6 +242,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
 
     setStartTime(defaultStart);
     setEndTime(defaultEnd);
+    setShiftPosition(emp.position || '');
     setNotes(defaultNotes);
 
     // Calculate initial paid break to default actual break
@@ -158,6 +263,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
 
     setStartTime(shift.startTime);
     setEndTime(shift.endTime);
+    setShiftPosition(shift.position || emp?.position || '');
 
     // If shift has recorded actual break, use it; otherwise use paid break
     const calc = calculateShiftHours(shift.startTime, shift.endTime, undefined, cashier);
@@ -183,6 +289,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
       scheduleId: currentWeekFriday,
       employeeId: modalEmployee.employeeId,
       employeeName: modalEmployee.fullName,
+      position: shiftPosition.trim() || modalEmployee.position || '',
       date: modalDay.date,
       dayOfWeek: modalDay.dayOfWeek,
       startTime,
@@ -303,7 +410,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
       return [
         `"${grp.name}"`,
         emp.employeeId,
-        `"${emp.fullName}"`,
+        `"${emp.nickname?.trim() || emp.fullName}"`,
         `"${emp.department}"`,
         ...dayCells,
         summary.totalHours.toFixed(2),
@@ -383,20 +490,22 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
             .map((d) => {
               const shift = empShifts.find((s) => s.date === d.date);
               if (!shift) {
-                return `<td style="color: #94a3b8; font-size: 9px; text-align: center; background: #fafafa;">OFF</td>`;
+                return `<td style="color: #94a3b8; font-size: 13px; font-weight: 600; text-align: center; background: #fafafa;">OFF</td>`;
               }
 
               const hoursNum = shift.hours.toFixed(1);
               const overnightIcon = shift.isOvernight ? ' 🌙' : '';
               const breakDetail =
                 mode === 'detailed' && shift.actualBreakMinutes
-                  ? `<div style="font-size: 8px; color: #64748b;">휴게 ${shift.actualBreakMinutes}분</div>`
+                  ? `<div style="font-size: 11px; color: #64748b;">${language === 'ko' ? `휴게 ${shift.actualBreakMinutes}분` : `Break ${shift.actualBreakMinutes}m`}</div>`
                   : '';
 
               return `
-                <td style="text-align: center; padding: 4px 2px; line-height: 1.2;">
-                  <div style="font-weight: 700; font-size: 9.5px; color: #0f172a;">${shift.startTime} - ${shift.endTime}</div>
-                  <div style="font-size: 8.5px; color: #047857; font-weight: 700;">${hoursNum}h${overnightIcon}</div>
+                <td style="text-align: center; padding: 5px 3px; line-height: 1.25;">
+                  <div style="font-weight: 700; font-size: 14px; color: #0f172a;">${shift.startTime}</div>
+                  <div style="font-weight: 700; font-size: 14px; color: #0f172a;">${shift.endTime}</div>
+                  <div style="font-size: 12px; color: #047857; font-weight: 700;">${hoursNum}h (${language === 'ko' ? `휴게 ${shift.paidBreakMinutes || 0}분` : `Break ${shift.paidBreakMinutes || 0}m`})${overnightIcon}</div>
+                  ${shift.position ? `<div style="font-size: 12px; color: #4f46e5; font-weight: 700;">${shift.position}</div>` : ''}
                   ${breakDetail}
                 </td>
               `;
@@ -407,18 +516,19 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
           const totalStyle = isOt
             ? 'color: #b91c1c; font-weight: 800; background: #fef2f2;'
             : 'color: #047857; font-weight: 700;';
+          const empDisplayName = emp.nickname?.trim() || emp.fullName;
 
           rowsHtml += `
             <tr style="border-bottom: 1px solid #cbd5e1; ${index % 2 === 1 ? 'background: #f8fafc;' : ''}">
-              <td style="text-align: center; font-size: 9px; color: #64748b; width: 28px;">${index + 1}</td>
-              <td style="text-align: left; padding: 4px 8px; width: 145px;">
-                <div style="font-weight: 700; font-size: 10px; color: #0f172a;">${emp.fullName}</div>
-                <div style="font-size: 8.5px; color: #64748b;">${emp.department} • ${emp.position}</div>
+              <td style="text-align: center; font-size: 12px; color: #64748b; width: 32px;">${index + 1}</td>
+              <td style="text-align: left; padding: 5px 8px; width: 160px;">
+                <div style="font-weight: 700; font-size: 15px; color: #0f172a;">${empDisplayName}</div>
+                <div style="font-size: 12px; color: #64748b;">${emp.department} • ${emp.position}</div>
               </td>
               ${dayCells}
-              <td style="text-align: right; padding: 4px 8px; width: 85px; ${totalStyle}">
+              <td style="text-align: right; padding: 5px 8px; width: 90px; font-size: 13px; ${totalStyle}">
                 <div>${summary.totalHours.toFixed(1)}h</div>
-                ${isOt ? `<div style="font-size: 8px; color: #dc2626;">OT +${summary.overtimeHours.toFixed(1)}h</div>` : ''}
+                ${isOt ? `<div style="font-size: 11px; color: #dc2626;">OT +${summary.overtimeHours.toFixed(1)}h</div>` : ''}
               </td>
             </tr>
           `;
@@ -430,28 +540,28 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
 
       tablesHtml += `
         <div style="margin-bottom: 14px; page-break-inside: avoid;">
-          <div style="background: #0f172a; color: #ffffff; padding: 6px 10px; font-weight: 700; font-size: 11px; display: flex; justify-content: space-between; align-items: center;">
+          <div style="background: #0f172a; color: #ffffff; padding: 7px 10px; font-weight: 700; font-size: 14px; display: flex; justify-content: space-between; align-items: center;">
             <span>${grp.name}</span>
-            <span style="font-size: 9.5px; font-weight: normal; opacity: 0.9;">
+            <span style="font-size: 12px; font-weight: normal; opacity: 0.9;">
               ${language === 'ko' ? '인원' : 'Staff'}: ${grpEmps.length}명 • ${language === 'ko' ? '소계' : 'Subtotal'}: ${grpHours.toFixed(1)}h ${grpOt > 0 ? `(OT: ${grpOt.toFixed(1)}h)` : ''}
             </span>
           </div>
-          <table style="width: 100%; border-collapse: collapse; font-size: 9.5px; border: 1px solid #0f172a; margin-top: -1px;">
+          <table style="width: 100%; border-collapse: collapse; font-size: 13px; border: 1px solid #0f172a; margin-top: -1px;">
             <thead>
-              <tr style="background: #f1f5f9; color: #0f172a; font-size: 9px; font-weight: 700; border-bottom: 1px solid #cbd5e1;">
-                <th style="padding: 5px 2px; width: 28px; text-align: center; border-right: 1px solid #cbd5e1;">No</th>
-                <th style="padding: 5px 8px; width: 145px; text-align: left; border-right: 1px solid #cbd5e1;">${language === 'ko' ? '직원 / 부서' : 'Employee / Dept'}</th>
+              <tr style="background: #f1f5f9; color: #0f172a; font-size: 13px; font-weight: 700; border-bottom: 1px solid #cbd5e1;">
+                <th style="padding: 6px 2px; width: 32px; text-align: center; border-right: 1px solid #cbd5e1;">No</th>
+                <th style="padding: 6px 8px; width: 160px; text-align: left; border-right: 1px solid #cbd5e1;">${language === 'ko' ? '직원 / 부서' : 'Employee / Dept'}</th>
                 ${days
                   .map(
                     (d, i) => `
-                  <th style="padding: 4px 2px; text-align: center; border-right: 1px solid #cbd5e1; ${i === 1 || i === 2 ? 'background: #fef3c7; color: #92400e;' : ''}">
+                  <th style="padding: 5px 2px; text-align: center; border-right: 1px solid #cbd5e1; ${i === 1 || i === 2 ? 'background: #fef3c7; color: #92400e;' : ''}">
                     <div>${language === 'ko' ? d.dayOfWeekKo : d.dayOfWeek}</div>
-                    <div style="font-size: 8px; opacity: 0.85;">${language === 'ko' ? d.displayDateKo : d.displayDate}</div>
+                    <div style="font-size: 11.5px; opacity: 0.85;">${language === 'ko' ? d.displayDateKo : d.displayDate}</div>
                   </th>
                 `
                   )
                   .join('')}
-                <th style="padding: 5px 8px; width: 85px; text-align: right;">${language === 'ko' ? '주간 합계' : 'Weekly Total'}</th>
+                <th style="padding: 6px 8px; width: 90px; text-align: right;">${language === 'ko' ? '주간 합계' : 'Weekly Total'}</th>
               </tr>
             </thead>
             <tbody>
@@ -470,7 +580,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
   <style>
     @page {
       size: portrait;
-      margin: 8mm 6mm;
+      margin: 6mm 5mm;
     }
     * { box-sizing: border-box; }
     body {
@@ -718,10 +828,34 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
 
           <button
             onClick={handleExportCsv}
-            className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors"
+            className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
           >
             <FileSpreadsheet className="w-3.5 h-3.5" />
             <span>{t('exportCsv')}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleQuickSaveScheduleBackup}
+            className="px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
+            title={language === 'ko' ? '현재 주간 스케줄 백업 파일을 컴퓨터에 저장합니다' : 'Save current schedule backup (.json) to computer'}
+          >
+            <HardDriveDownload className="w-3.5 h-3.5 text-emerald-400" />
+            <span>{language === 'ko' ? '컴퓨터 백업 저장' : 'Save Backup'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              refreshAutoBackups();
+              setBackupFeedback(null);
+              setIsBackupModalOpen(true);
+            }}
+            className="px-3 py-2 rounded-xl bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 text-indigo-800 text-xs font-bold shadow-xs flex items-center space-x-1.5 transition-colors cursor-pointer"
+            title={language === 'ko' ? '자동 백업 내역 및 컴퓨터 파일 불러오기' : 'View auto-backups or load backup file'}
+          >
+            <History className="w-3.5 h-3.5 text-indigo-600" />
+            <span>{language === 'ko' ? '자동백업 · 불러오기' : 'Backups & Load'}</span>
           </button>
         </div>
       </div>
@@ -746,7 +880,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                 selectedGroup === 'ALL' ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-700'
               }`}
             >
-              {activeEmployees.length}명
+              {activeEmployees.length}{language === 'ko' ? '명' : ' staff'}
             </span>
           </button>
 
@@ -775,7 +909,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                     isSelected ? 'bg-white shadow-2xs font-extrabold text-slate-900' : 'bg-slate-100 text-slate-600'
                   }`}
                 >
-                  {grpEmps.length}명 • {totalHours.toFixed(0)}h
+                  {grpEmps.length}{language === 'ko' ? '명' : ''} • {totalHours.toFixed(0)}h
                 </span>
               </button>
             );
@@ -798,7 +932,8 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
           const overnightCount = grpShifts.filter((s) => s.isOvernight).length;
 
           return (
-            <div className={`p-4 ${currentGrp.badgeBg} border-t border-slate-100 flex flex-col md:flex-row md:items-center justify-between gap-3`}>
+            <>
+              <div className={`p-4 ${currentGrp.badgeBg} border-t border-slate-100 flex flex-col md:flex-row md:items-center justify-between gap-3`}>
               <div className="flex items-center space-x-3">
                 <div className="w-10 h-10 rounded-xl bg-white shadow-xs border border-slate-200 flex items-center justify-center text-slate-800">
                   <Building className="w-5 h-5 text-emerald-700" />
@@ -856,6 +991,49 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                 )}
               </div>
             </div>
+
+            {/* Culmore Supermarket Department Parts (Item 3) */}
+            {selectedGroup === 'group_2' && (
+              <div className="p-2.5 bg-blue-50/70 border-t border-blue-200/80 flex items-center space-x-1.5 overflow-x-auto no-scrollbar">
+                <span className="text-[11px] font-black text-blue-900 uppercase tracking-wider px-2 shrink-0">
+                  {language === 'ko' ? '마트 파트:' : 'Parts:'}
+                </span>
+                {[
+                  { id: 'ALL', name: language === 'ko' ? '전체 파트' : 'All Parts', icon: '🛒' },
+                  { id: 'Meat & Seafood', name: language === 'ko' ? '정육/수산 (Meat)' : 'Meat & Seafood', icon: '🥩' },
+                  { id: 'Cashiers & Front End', name: language === 'ko' ? '캐셔 (Cashier)' : 'Cashiers & Front End', icon: '💳' },
+                  { id: 'Kitchen & Cooking', name: language === 'ko' ? '키친/조리 (Kitchen)' : 'Kitchen & Cooking', icon: '🍳' },
+                  { id: 'Grocery & Stocking', name: language === 'ko' ? '그로서리 (Grocery)' : 'Grocery & Stocking', icon: '📦' },
+                  { id: 'Produce', name: language === 'ko' ? '농산 (Produce)' : 'Produce & Fresh', icon: '🥬' },
+                  { id: 'Bakery', name: language === 'ko' ? '베이커리 (Bakery)' : 'Bakery', icon: '🥖' },
+                ].map((part) => {
+                  const isSelected = selectedCulmorePart === part.id;
+                  const count = part.id === 'ALL'
+                    ? activeEmployees.filter(e => getBusinessGroup(e.businessGroup || e.groupNumber).id === 'group_2').length
+                    : activeEmployees.filter(e => getBusinessGroup(e.businessGroup || e.groupNumber).id === 'group_2' && (e.department === part.id || (part.id === 'Kitchen & Cooking' && e.department === 'Deli & Prepared Foods'))).length;
+
+                  return (
+                    <button
+                      key={part.id}
+                      type="button"
+                      onClick={() => setSelectedCulmorePart(part.id)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap flex items-center space-x-1.5 cursor-pointer shrink-0 ${
+                        isSelected
+                          ? 'bg-blue-700 text-white shadow-xs ring-1 ring-blue-700'
+                          : 'bg-white hover:bg-blue-100/70 text-slate-700 border border-blue-200/80'
+                      }`}
+                    >
+                      <span>{part.icon}</span>
+                      <span>{part.name}</span>
+                      <span className={`px-1.5 py-0.2 rounded-full font-mono text-[10px] ${isSelected ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-600'}`}>
+                        {count}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </>
           );
         })() : (
           /* When ALL is selected, show 5-branch summary stat cards */
@@ -874,7 +1052,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                 >
                   <div className="flex items-center justify-between text-[10px] font-bold text-slate-500">
                     <span>{grp.name}</span>
-                    <span className="font-mono text-slate-700">{grpEmps.length}명</span>
+                    <span className="font-mono text-slate-700">{grpEmps.length}{language === 'ko' ? '명' : ' staff'}</span>
                   </div>
                   <div className="mt-1 flex items-baseline justify-between">
                     <span className="font-mono font-black text-xs text-slate-900 group-hover/stat:text-emerald-700">
@@ -913,14 +1091,14 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
       {/* Main 7-Day Weekly Grid Table */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden print:overflow-visible print:border-none print:shadow-none">
         <div className="overflow-x-auto print:overflow-visible">
-          <table className="w-full border-collapse text-xs">
+          <table className="w-full border-collapse text-base">
             <thead>
               <tr className="bg-slate-900 text-white font-bold">
                 {/* Employee Info Header */}
-                <th className="py-3.5 px-4 text-left w-64 sticky left-0 z-20 bg-slate-900 border-r border-slate-800">
-                  <div className="flex items-center space-x-1">
-                    <span>{t('employeeDirectory')}</span>
-                    <span className="text-[10px] text-slate-400">({displayedEmployees.length})</span>
+                <th className="py-4 px-4 text-left w-72 sticky left-0 z-20 bg-slate-900 border-r border-slate-800">
+                  <div className="flex items-center space-x-1.5">
+                    <span className="text-base">{t('employeeDirectory')}</span>
+                    <span className="text-xs text-slate-400">({displayedEmployees.length})</span>
                   </div>
                 </th>
 
@@ -930,19 +1108,19 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                   return (
                     <th
                       key={day.date}
-                      className={`py-3 px-2 text-center border-r border-slate-800 min-w-32 ${
+                      className={`py-3.5 px-2 text-center border-r border-slate-800 min-w-44 ${
                         isWeekend ? 'bg-slate-800/80 text-amber-300' : ''
                       }`}
                     >
                       <div className="flex flex-col items-center">
-                        <span className="text-xs uppercase tracking-wider font-extrabold">
+                        <span className="text-lg uppercase tracking-wider font-extrabold">
                           {language === 'ko' ? day.dayOfWeekKo : day.dayOfWeek}
                         </span>
-                        <span className="text-[11px] font-mono opacity-80 mt-0.5">
+                        <span className="text-sm font-mono opacity-80 mt-0.5">
                           {language === 'ko' ? day.displayDateKo : day.displayDate}
                         </span>
                         {isWeekend && (
-                          <span className="text-[9px] px-1 rounded bg-amber-500/20 text-amber-300 font-normal mt-0.5">
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-normal mt-0.5">
                             Peak Grocery
                           </span>
                         )}
@@ -950,14 +1128,6 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                     </th>
                   );
                 })}
-
-                {/* Weekly Total Hours Header */}
-                <th className="py-3 px-3 text-right w-28 bg-slate-900">
-                  <div className="flex flex-col items-end">
-                    <span className="text-xs font-bold text-white uppercase">{t('weeklyTotalHours')}</span>
-                    <span className="text-[10px] text-emerald-400 font-mono">FLSA 40h</span>
-                  </div>
-                </th>
               </tr>
             </thead>
 
@@ -1030,41 +1200,40 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                       {grpEmps.map((emp) => {
                         const empShifts = effectiveShifts.filter((s) => s.employeeId === emp.employeeId);
                         const summary = calculateWeeklyHoursSummary(empShifts);
-                        const isOvertime = summary.overtimeHours > 0;
-                        const isMissing = summary.totalHours === 0;
+                        const displayName = emp.nickname?.trim() || emp.fullName;
 
                         return (
                           <tr key={emp.id} className="hover:bg-slate-50/70 transition-colors group">
                             {/* Employee Profile Cell */}
-                            <td className="py-2.5 px-3.5 sticky left-0 z-10 bg-white group-hover:bg-slate-50 border-r border-slate-200">
+                            <td className="py-3 px-4 sticky left-0 z-10 bg-white group-hover:bg-slate-50 border-r border-slate-200">
                               <div>
                                 <div className="flex items-center space-x-1.5">
-                                  <span className="font-bold text-slate-900 text-xs truncate max-w-36">
-                                    {emp.fullName}
+                                  <span className="font-extrabold text-slate-900 text-base truncate max-w-48">
+                                    {displayName}
                                   </span>
-                                  <span className="font-mono text-[10px] text-slate-400">
+                                  <span className="font-mono text-xs text-slate-400">
                                     {emp.employeeId}
                                   </span>
                                 </div>
                                 {emp.fullNameKo && (
-                                  <p className="text-[11px] text-slate-500 font-medium">{emp.fullNameKo}</p>
+                                  <p className="text-sm text-slate-500 font-medium">{emp.fullNameKo}</p>
                                 )}
-                                <div className="flex flex-wrap items-center gap-1 mt-1">
+                                <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                                   <span
-                                    className={`text-[9px] px-1.5 py-0.2 rounded font-bold border ${grp.badgeBg} truncate max-w-28`}
+                                    className={`text-xs px-2 py-0.5 rounded font-bold border ${grp.badgeBg} truncate max-w-36`}
                                     title={grp.name}
                                   >
                                     {grp.name}
                                   </span>
-                                  {/* Total Hours next to group name (Item 9) */}
-                                  <span className="font-mono text-[10px] font-extrabold px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-800 border border-emerald-200">
-                                    총 {summary.totalHours.toFixed(1)}h{summary.overtimeHours > 0 ? ` (+${summary.overtimeHours.toFixed(1)} OT)` : ''}
+                                  {/* Total Hours next to group name */}
+                                  <span className="font-mono text-xs font-extrabold px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200">
+                                    {language === 'ko' ? '총 ' : 'Total '}{summary.totalHours.toFixed(1)}h{summary.overtimeHours > 0 ? ` (+${summary.overtimeHours.toFixed(1)} OT)` : ''}
                                   </span>
-                                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-100 text-slate-600 font-semibold truncate max-w-28">
+                                  <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-semibold truncate max-w-36">
                                     {emp.department}
                                   </span>
-                                  {/* Hourly wage hidden on print (Item 8) */}
-                                  <span className="font-mono text-[10px] text-emerald-700 font-bold ml-auto print:hidden">
+                                  {/* Hourly wage hidden on print */}
+                                  <span className="font-mono text-xs text-emerald-700 font-bold ml-auto print:hidden">
                                     ${emp.hourlyWage}/h
                                   </span>
                                 </div>
@@ -1078,107 +1247,269 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                               return (
                                 <td
                                   key={day.date}
-                                  className="py-1.5 px-1.5 border-r border-slate-100 text-center align-top min-w-32"
+                                  className="py-2 px-2 border-r border-slate-100 text-center align-top min-w-44"
                                 >
                                   {shift ? (
                                     <div
                                       onClick={() => openEditModal(shift)}
-                                      className={`p-2 rounded-xl text-left cursor-pointer transition-all border ${
+                                      className={`p-2.5 rounded-xl text-left cursor-pointer transition-all border ${
                                         shift.isOvernight
                                           ? 'bg-slate-900 text-white border-slate-800 hover:bg-slate-800 shadow-xs'
                                           : 'bg-emerald-50 text-emerald-950 border-emerald-200/90 hover:bg-emerald-100 hover:border-emerald-300'
                                       }`}
                                     >
-                                      {/* Shift Time */}
-                                      <div className="flex items-center justify-between text-[11px] font-bold">
-                                        <span>{shift.startTime} - {shift.endTime}</span>
+                                      {/* Line 1: 시작시간 */}
+                                      <div className="flex items-center justify-between text-base font-bold">
+                                        <div className="flex items-center space-x-1">
+                                          <span className={`text-xs font-semibold ${shift.isOvernight ? 'text-slate-300' : 'text-slate-500'}`}>
+                                            {language === 'ko' ? '시작: ' : 'Start: '}
+                                          </span>
+                                          <span className="font-mono text-base">{shift.startTime}</span>
+                                        </div>
                                         {shift.isOvernight && (
-                                          <span title="Overnight shift">
-                                            <Moon className="w-3 h-3 text-indigo-300 shrink-0" />
+                                          <span title={language === 'ko' ? '자정 넘김 야간조' : 'Overnight shift'}>
+                                            <Moon className="w-4 h-4 text-indigo-300 shrink-0" />
                                           </span>
                                         )}
                                       </div>
 
-                                      {/* Hours and Break */}
-                                      <div className="flex items-center justify-between mt-1 text-[10px]">
-                                        <span
-                                          className={`font-mono font-bold ${
-                                            shift.isOvernight ? 'text-emerald-400' : 'text-emerald-800'
-                                          }`}
-                                        >
+                                      {/* Line 2: 끝나는 시간 */}
+                                      <div className="flex items-center space-x-1 text-base font-bold mt-0.5">
+                                        <span className={`text-xs font-semibold ${shift.isOvernight ? 'text-slate-300' : 'text-slate-500'}`}>
+                                          {language === 'ko' ? '종료: ' : 'End: '}
+                                        </span>
+                                        <span className="font-mono text-base">{shift.endTime}</span>
+                                      </div>
+
+                                      {/* Line 3: 총 근무시간과 휴게시간 */}
+                                      <div className="flex items-center justify-between mt-1.5 text-sm font-medium">
+                                        <span className={`font-mono font-bold ${shift.isOvernight ? 'text-emerald-400' : 'text-emerald-800'}`}>
                                           {shift.hours.toFixed(1)} hrs
                                         </span>
                                         {shift.excessBreakMinutes && shift.excessBreakMinutes > 0 ? (
                                           <span
-                                            className="px-1 py-0.2 rounded bg-rose-100 text-rose-700 font-bold text-[9px]"
+                                            className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 font-bold text-xs"
                                             title={`${shift.actualBreakMinutes ?? shift.breakMinutes}m taken, ${shift.excessBreakMinutes}m excess unpaid`}
                                           >
                                             -{shift.excessBreakMinutes}m {language === 'ko' ? '공제' : 'unpaid'}
                                           </span>
                                         ) : shift.paidBreakMinutes && shift.paidBreakMinutes > 0 ? (
                                           <span
-                                            className="opacity-75 text-[9px] text-emerald-700"
-                                            title={`${shift.paidBreakMinutes}m paid break granted`}
+                                            className="text-xs font-bold text-emerald-700 bg-emerald-100/70 px-1.5 py-0.5 rounded"
+                                            title={`${shift.paidBreakMinutes}m break`}
                                           >
-                                            {shift.paidBreakMinutes}m {language === 'ko' ? '유급' : 'paid'}
+                                            {language === 'ko' ? '휴게 ' : 'Break '}{shift.paidBreakMinutes}m
                                           </span>
                                         ) : shift.breakMinutes > 0 ? (
-                                          <span className="opacity-75">
+                                          <span className="text-xs text-slate-500">
                                             {shift.breakMinutes}m
                                           </span>
                                         ) : null}
                                       </div>
 
-                                      {shift.isOvernight && (
-                                        <div className="mt-1">
-                                          <span className="inline-block text-[9px] px-1 rounded bg-indigo-500/30 text-indigo-200 font-medium">
-                                            🌙 {language === 'ko' ? '야간조 (자정)' : 'Overnight'}
-                                          </span>
-                                        </div>
-                                      )}
+                                      {/* Line 4: Position */}
+                                      <div className="mt-1.5 pt-1.5 border-t border-slate-200/60">
+                                        <span
+                                          className={`px-2 py-0.5 rounded font-bold text-sm truncate max-w-full block ${
+                                            shift.isOvernight ? 'bg-slate-800 text-slate-200' : 'bg-white text-slate-700 border border-slate-200'
+                                          }`}
+                                          title={shift.position || emp.position}
+                                        >
+                                          {shift.position || emp.position || (language === 'ko' ? '파트' : 'Role')}
+                                        </span>
+                                      </div>
                                     </div>
                                   ) : (
                                     <button
                                       onClick={() => openAddModal(emp, day)}
-                                      className="w-full h-14 rounded-xl border border-dashed border-slate-200 hover:border-emerald-400 hover:bg-emerald-50/50 flex flex-col items-center justify-center text-slate-400 hover:text-emerald-700 transition-all opacity-40 hover:opacity-100 group/cell no-print"
+                                      className="w-full h-24 rounded-xl border border-dashed border-slate-200 hover:border-emerald-400 hover:bg-emerald-50/50 flex flex-col items-center justify-center text-slate-400 hover:text-emerald-700 transition-all opacity-40 hover:opacity-100 group/cell no-print cursor-pointer"
                                     >
-                                      <Plus className="w-3.5 h-3.5 group-hover/cell:scale-110 transition-transform" />
-                                      <span className="text-[10px] mt-0.5">{t('noShift')}</span>
+                                      <Plus className="w-4 h-4 group-hover/cell:scale-110 transition-transform" />
+                                      <span className="text-sm mt-0.5">{t('noShift')}</span>
                                     </button>
                                   )}
                                 </td>
                               );
                             })}
+                          </tr>
+                        );
+                      })}
+                    </React.Fragment>
+                  );
+                })
+              ) : selectedGroup === 'group_2' && selectedCulmorePart === 'ALL' ? (
+                // Culmore Supermarket grouped by department parts (Item 3)
+                [
+                  { id: 'Meat & Seafood', name: '정육 / 수산 (Meat & Seafood)', nameEn: 'Meat & Seafood', icon: '🥩' },
+                  { id: 'Cashiers & Front End', name: '캐셔 / 계산원 (Cashiers & Front End)', nameEn: 'Cashiers & Front End', icon: '💳' },
+                  { id: 'Kitchen & Cooking', name: '키친 / 델리 / 조리 (Kitchen & Deli)', nameEn: 'Kitchen & Cooking', icon: '🍳' },
+                  { id: 'Grocery & Stocking', name: '그로서리 / 진열 (Grocery & Stocking)', nameEn: 'Grocery & Stocking', icon: '📦' },
+                  { id: 'Produce', name: '농산 / 야채과일 (Produce & Fresh)', nameEn: 'Produce & Fresh', icon: '🥬' },
+                  { id: 'Bakery', name: '베이커리 (Bakery)', nameEn: 'Bakery', icon: '🥖' },
+                  { id: 'Management', name: '매니지먼트 / 관리 (Management)', nameEn: 'Management', icon: '💼' },
+                ].map((part) => {
+                  const partEmps = displayedEmployees.filter((e) => {
+                    if (part.id === 'Kitchen & Cooking') {
+                      return e.department === 'Kitchen & Cooking' || e.department === 'Deli & Prepared Foods';
+                    }
+                    if (part.id === 'Management') {
+                      return e.department === 'Management' || (e.department !== 'Meat & Seafood' && e.department !== 'Cashiers & Front End' && e.department !== 'Kitchen & Cooking' && e.department !== 'Deli & Prepared Foods' && e.department !== 'Grocery & Stocking' && e.department !== 'Produce' && e.department !== 'Bakery');
+                    }
+                    return e.department === part.id;
+                  });
 
-                            {/* Weekly Total Hours Summary */}
-                            <td className="py-2 px-3 text-right border-l border-slate-200 align-middle">
-                              <div className="flex flex-col items-end">
-                                <span
-                                  className={`font-mono font-black text-sm px-2 py-0.5 rounded-lg ${
-                                    isOvertime
-                                      ? 'bg-amber-100 text-amber-900 border border-amber-300'
-                                      : isMissing
-                                      ? 'bg-rose-50 text-rose-700 border border-rose-200'
-                                      : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                                  }`}
-                                >
-                                  {summary.totalHours.toFixed(1)} hrs
-                                </span>
+                  if (partEmps.length === 0) return null;
 
-                                {isOvertime && (
-                                  <span className="text-[10px] font-bold text-amber-700 flex items-center space-x-0.5 mt-0.5">
-                                    <AlertTriangle className="w-2.5 h-2.5" />
-                                    <span>+{summary.overtimeHours.toFixed(1)}h OT</span>
+                  return (
+                    <React.Fragment key={part.id}>
+                      {/* Part Section Header */}
+                      <tr className="bg-blue-50/90 border-y border-blue-200">
+                        <td colSpan={8} className="py-2.5 px-4 sticky left-0 z-10 bg-blue-50/90">
+                          <div className="flex items-center space-x-2">
+                            <span className="text-lg">{part.icon}</span>
+                            <span className="text-blue-950 font-black text-base">
+                              {language === 'ko' ? part.name : part.nameEn}
+                            </span>
+                            <span className="px-2.5 py-0.5 rounded-full bg-white border border-blue-200 text-blue-800 text-xs font-mono font-bold">
+                              {partEmps.length}{language === 'ko' ? '명' : ' staff'}
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+
+                      {partEmps.map((emp) => {
+                        const grp = getBusinessGroup(emp.businessGroup || emp.groupNumber);
+                        const empShifts = effectiveShifts.filter((s) => s.employeeId === emp.employeeId);
+                        const summary = calculateWeeklyHoursSummary(empShifts);
+                        const displayName = emp.nickname?.trim() || emp.fullName;
+
+                        return (
+                          <tr key={emp.id} className="hover:bg-slate-50/70 transition-colors group">
+                            {/* Employee Profile Cell */}
+                            <td className="py-3 px-4 sticky left-0 z-10 bg-white group-hover:bg-slate-50 border-r border-slate-200">
+                              <div>
+                                <div className="flex items-center space-x-1.5">
+                                  <span className="font-extrabold text-slate-900 text-base truncate max-w-48">
+                                    {displayName}
                                   </span>
-                                )}
-
-                                {isMissing && (
-                                  <span className="text-[10px] font-bold text-rose-600 mt-0.5">
-                                    {language === 'ko' ? '미배정' : 'Missing'}
+                                  <span className="font-mono text-xs text-slate-400">
+                                    {emp.employeeId}
                                   </span>
+                                </div>
+                                {emp.fullNameKo && (
+                                  <p className="text-sm text-slate-500 font-medium">{emp.fullNameKo}</p>
                                 )}
+                                <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                                  <span
+                                    className={`text-xs px-2 py-0.5 rounded font-bold border ${grp.badgeBg} truncate max-w-36`}
+                                    title={grp.name}
+                                  >
+                                    {grp.name}
+                                  </span>
+                                  <span className="font-mono text-xs font-extrabold px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200">
+                                    {language === 'ko' ? '총 ' : 'Total '}{summary.totalHours.toFixed(1)}h{summary.overtimeHours > 0 ? ` (+${summary.overtimeHours.toFixed(1)} OT)` : ''}
+                                  </span>
+                                  <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-semibold truncate max-w-36">
+                                    {emp.department}
+                                  </span>
+                                  <span className="font-mono text-xs text-emerald-700 font-bold ml-auto print:hidden">
+                                    ${emp.hourlyWage}/h
+                                  </span>
+                                </div>
                               </div>
                             </td>
+
+                            {/* 7 Daily Cells */}
+                            {days.map((day) => {
+                              const shift = empShifts.find((s) => s.date === day.date);
+
+                              return (
+                                <td
+                                  key={day.date}
+                                  className="py-2 px-2 border-r border-slate-100 text-center align-top min-w-44"
+                                >
+                                  {shift ? (
+                                    <div
+                                      onClick={() => openEditModal(shift)}
+                                      className={`p-2.5 rounded-xl text-left cursor-pointer transition-all border ${
+                                        shift.isOvernight
+                                          ? 'bg-slate-900 text-white border-slate-800 hover:bg-slate-800 shadow-xs'
+                                          : 'bg-emerald-50 text-emerald-950 border-emerald-200/90 hover:bg-emerald-100 hover:border-emerald-300'
+                                      }`}
+                                    >
+                                      {/* Line 1: 시작시간 */}
+                                      <div className="flex items-center justify-between text-base font-bold">
+                                        <div className="flex items-center space-x-1">
+                                          <span className={`text-xs font-semibold ${shift.isOvernight ? 'text-slate-300' : 'text-slate-500'}`}>
+                                            {language === 'ko' ? '시작: ' : 'Start: '}
+                                          </span>
+                                          <span className="font-mono text-base">{shift.startTime}</span>
+                                        </div>
+                                        {shift.isOvernight && (
+                                          <span title={language === 'ko' ? '자정 넘김 야간조' : 'Overnight shift'}>
+                                            <Moon className="w-4 h-4 text-indigo-300 shrink-0" />
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      {/* Line 2: 끝나는 시간 */}
+                                      <div className="flex items-center space-x-1 text-base font-bold mt-0.5">
+                                        <span className={`text-xs font-semibold ${shift.isOvernight ? 'text-slate-300' : 'text-slate-500'}`}>
+                                          {language === 'ko' ? '종료: ' : 'End: '}
+                                        </span>
+                                        <span className="font-mono text-base">{shift.endTime}</span>
+                                      </div>
+
+                                      {/* Line 3: 총 근무시간과 휴게시간 */}
+                                      <div className="flex items-center justify-between mt-1.5 text-sm font-medium">
+                                        <span className={`font-mono font-bold ${shift.isOvernight ? 'text-emerald-400' : 'text-emerald-800'}`}>
+                                          {shift.hours.toFixed(1)} hrs
+                                        </span>
+                                        {shift.excessBreakMinutes && shift.excessBreakMinutes > 0 ? (
+                                          <span
+                                            className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 font-bold text-xs"
+                                            title={`${shift.actualBreakMinutes ?? shift.breakMinutes}m taken, ${shift.excessBreakMinutes}m excess unpaid`}
+                                          >
+                                            -{shift.excessBreakMinutes}m {language === 'ko' ? '공제' : 'unpaid'}
+                                          </span>
+                                        ) : shift.paidBreakMinutes && shift.paidBreakMinutes > 0 ? (
+                                          <span
+                                            className="text-xs font-bold text-emerald-700 bg-emerald-100/70 px-1.5 py-0.5 rounded"
+                                            title={`${shift.paidBreakMinutes}m break`}
+                                          >
+                                            {language === 'ko' ? '휴게 ' : 'Break '}{shift.paidBreakMinutes}m
+                                          </span>
+                                        ) : shift.breakMinutes > 0 ? (
+                                          <span className="text-xs text-slate-500">
+                                            {shift.breakMinutes}m
+                                          </span>
+                                        ) : null}
+                                      </div>
+
+                                      {/* Line 4: Position */}
+                                      <div className="mt-1.5 pt-1.5 border-t border-slate-200/60">
+                                        <span
+                                          className={`px-2 py-0.5 rounded font-bold text-sm truncate max-w-full block ${
+                                            shift.isOvernight ? 'bg-slate-800 text-slate-200' : 'bg-white text-slate-700 border border-slate-200'
+                                          }`}
+                                          title={shift.position || emp.position}
+                                        >
+                                          {shift.position || emp.position || (language === 'ko' ? '파트' : 'Role')}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      onClick={() => openAddModal(emp, day)}
+                                      className="w-full h-24 rounded-xl border border-dashed border-slate-200 hover:border-emerald-400 hover:bg-emerald-50/50 flex flex-col items-center justify-center text-slate-400 hover:text-emerald-700 transition-all opacity-40 hover:opacity-100 group/cell no-print cursor-pointer"
+                                    >
+                                      <Plus className="w-4 h-4 group-hover/cell:scale-110 transition-transform" />
+                                      <span className="text-sm mt-0.5">{t('noShift')}</span>
+                                    </button>
+                                  )}
+                                </td>
+                              );
+                            })}
                           </tr>
                         );
                       })}
@@ -1186,46 +1517,45 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                   );
                 })
               ) : (
-                // Focused Single Business Group Schedule
+                // Focused Single Business Group Schedule or Filtered Part
                 displayedEmployees.map((emp) => {
                   const grp = getBusinessGroup(emp.businessGroup || emp.groupNumber);
                   const empShifts = effectiveShifts.filter((s) => s.employeeId === emp.employeeId);
                   const summary = calculateWeeklyHoursSummary(empShifts);
-                  const isOvertime = summary.overtimeHours > 0;
-                  const isMissing = summary.totalHours === 0;
+                  const displayName = emp.nickname?.trim() || emp.fullName;
 
                   return (
                     <tr key={emp.id} className="hover:bg-slate-50/70 transition-colors group">
                       {/* Employee Profile Cell */}
-                      <td className="py-2.5 px-3.5 sticky left-0 z-10 bg-white group-hover:bg-slate-50 border-r border-slate-200">
+                      <td className="py-3 px-4 sticky left-0 z-10 bg-white group-hover:bg-slate-50 border-r border-slate-200">
                         <div>
                           <div className="flex items-center space-x-1.5">
-                            <span className="font-bold text-slate-900 text-xs truncate max-w-36">
-                              {emp.fullName}
+                            <span className="font-extrabold text-slate-900 text-base truncate max-w-48">
+                              {displayName}
                             </span>
-                            <span className="font-mono text-[10px] text-slate-400">
+                            <span className="font-mono text-xs text-slate-400">
                               {emp.employeeId}
                             </span>
                           </div>
                           {emp.fullNameKo && (
-                            <p className="text-[11px] text-slate-500 font-medium">{emp.fullNameKo}</p>
+                            <p className="text-sm text-slate-500 font-medium">{emp.fullNameKo}</p>
                           )}
-                          <div className="flex flex-wrap items-center gap-1 mt-1">
+                          <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                             <span
-                              className={`text-[9px] px-1.5 py-0.2 rounded font-bold border ${grp.badgeBg} truncate max-w-28`}
+                              className={`text-xs px-2 py-0.5 rounded font-bold border ${grp.badgeBg} truncate max-w-36`}
                               title={grp.name}
                             >
                               {grp.name}
                             </span>
-                            {/* Total Hours next to group name (Item 9) */}
-                            <span className="font-mono text-[10px] font-extrabold px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-800 border border-emerald-200">
-                              총 {summary.totalHours.toFixed(1)}h{summary.overtimeHours > 0 ? ` (+${summary.overtimeHours.toFixed(1)} OT)` : ''}
+                            {/* Total Hours next to group name */}
+                            <span className="font-mono text-xs font-extrabold px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200">
+                              {language === 'ko' ? '총 ' : 'Total '}{summary.totalHours.toFixed(1)}h{summary.overtimeHours > 0 ? ` (+${summary.overtimeHours.toFixed(1)} OT)` : ''}
                             </span>
-                            <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-100 text-slate-600 font-semibold truncate max-w-28">
+                            <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-semibold truncate max-w-36">
                               {emp.department}
                             </span>
-                            {/* Hourly wage hidden on print (Item 8) */}
-                            <span className="font-mono text-[10px] text-emerald-700 font-bold ml-auto print:hidden">
+                            {/* Hourly wage hidden on print */}
+                            <span className="font-mono text-xs text-emerald-700 font-bold ml-auto print:hidden">
                               ${emp.hourlyWage}/h
                             </span>
                           </div>
@@ -1239,107 +1569,90 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                         return (
                           <td
                             key={day.date}
-                            className="py-1.5 px-1.5 border-r border-slate-100 text-center align-top min-w-32"
+                            className="py-2 px-2 border-r border-slate-100 text-center align-top min-w-44"
                           >
                             {shift ? (
                               <div
                                 onClick={() => openEditModal(shift)}
-                                className={`p-2 rounded-xl text-left cursor-pointer transition-all border ${
+                                className={`p-2.5 rounded-xl text-left cursor-pointer transition-all border ${
                                   shift.isOvernight
                                     ? 'bg-slate-900 text-white border-slate-800 hover:bg-slate-800 shadow-xs'
                                     : 'bg-emerald-50 text-emerald-950 border-emerald-200/90 hover:bg-emerald-100 hover:border-emerald-300'
                                 }`}
                               >
-                                {/* Shift Time */}
-                                <div className="flex items-center justify-between text-[11px] font-bold">
-                                  <span>{shift.startTime} - {shift.endTime}</span>
+                                {/* Line 1: 시작시간 */}
+                                <div className="flex items-center justify-between text-base font-bold">
+                                  <div className="flex items-center space-x-1">
+                                    <span className={`text-xs font-semibold ${shift.isOvernight ? 'text-slate-300' : 'text-slate-500'}`}>
+                                      {language === 'ko' ? '시작: ' : 'Start: '}
+                                    </span>
+                                    <span className="font-mono text-base">{shift.startTime}</span>
+                                  </div>
                                   {shift.isOvernight && (
-                                    <span title="Overnight shift">
-                                      <Moon className="w-3 h-3 text-indigo-300 shrink-0" />
+                                    <span title={language === 'ko' ? '자정 넘김 야간조' : 'Overnight shift'}>
+                                      <Moon className="w-4 h-4 text-indigo-300 shrink-0" />
                                     </span>
                                   )}
                                 </div>
 
-                                {/* Hours and Break */}
-                                <div className="flex items-center justify-between mt-1 text-[10px]">
-                                  <span
-                                    className={`font-mono font-bold ${
-                                      shift.isOvernight ? 'text-emerald-400' : 'text-emerald-800'
-                                    }`}
-                                  >
+                                {/* Line 2: 끝나는 시간 */}
+                                <div className="flex items-center space-x-1 text-base font-bold mt-0.5">
+                                  <span className={`text-xs font-semibold ${shift.isOvernight ? 'text-slate-300' : 'text-slate-500'}`}>
+                                    {language === 'ko' ? '종료: ' : 'End: '}
+                                  </span>
+                                  <span className="font-mono text-base">{shift.endTime}</span>
+                                </div>
+
+                                {/* Line 3: 총 근무시간과 휴게시간 */}
+                                <div className="flex items-center justify-between mt-1.5 text-sm font-medium">
+                                  <span className={`font-mono font-bold ${shift.isOvernight ? 'text-emerald-400' : 'text-emerald-800'}`}>
                                     {shift.hours.toFixed(1)} hrs
                                   </span>
                                   {shift.excessBreakMinutes && shift.excessBreakMinutes > 0 ? (
                                     <span
-                                      className="px-1 py-0.2 rounded bg-rose-100 text-rose-700 font-bold text-[9px]"
+                                      className="px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 font-bold text-xs"
                                       title={`${shift.actualBreakMinutes ?? shift.breakMinutes}m taken, ${shift.excessBreakMinutes}m excess unpaid`}
                                     >
                                       -{shift.excessBreakMinutes}m {language === 'ko' ? '공제' : 'unpaid'}
                                     </span>
                                   ) : shift.paidBreakMinutes && shift.paidBreakMinutes > 0 ? (
                                     <span
-                                      className="opacity-75 text-[9px] text-emerald-700"
-                                      title={`${shift.paidBreakMinutes}m paid break granted`}
+                                      className="text-xs font-bold text-emerald-700 bg-emerald-100/70 px-1.5 py-0.5 rounded"
+                                      title={`${shift.paidBreakMinutes}m break`}
                                     >
-                                      {shift.paidBreakMinutes}m {language === 'ko' ? '유급' : 'paid'}
+                                      {language === 'ko' ? '휴게 ' : 'Break '}{shift.paidBreakMinutes}m
                                     </span>
                                   ) : shift.breakMinutes > 0 ? (
-                                    <span className="opacity-75">
+                                    <span className="text-xs text-slate-500">
                                       {shift.breakMinutes}m
                                     </span>
                                   ) : null}
                                 </div>
 
-                                {shift.isOvernight && (
-                                  <div className="mt-1">
-                                    <span className="inline-block text-[9px] px-1 rounded bg-indigo-500/30 text-indigo-200 font-medium">
-                                      🌙 {language === 'ko' ? '야간조 (자정)' : 'Overnight'}
-                                    </span>
-                                  </div>
-                                )}
+                                {/* Line 4: Position */}
+                                <div className="mt-1.5 pt-1.5 border-t border-slate-200/60">
+                                  <span
+                                    className={`px-2 py-0.5 rounded font-bold text-sm truncate max-w-full block ${
+                                      shift.isOvernight ? 'bg-slate-800 text-slate-200' : 'bg-white text-slate-700 border border-slate-200'
+                                    }`}
+                                    title={shift.position || emp.position}
+                                  >
+                                    {shift.position || emp.position || (language === 'ko' ? '파트' : 'Role')}
+                                  </span>
+                                </div>
                               </div>
                             ) : (
                               <button
                                 onClick={() => openAddModal(emp, day)}
-                                className="w-full h-14 rounded-xl border border-dashed border-slate-200 hover:border-emerald-400 hover:bg-emerald-50/50 flex flex-col items-center justify-center text-slate-400 hover:text-emerald-700 transition-all opacity-40 hover:opacity-100 group/cell no-print"
+                                className="w-full h-24 rounded-xl border border-dashed border-slate-200 hover:border-emerald-400 hover:bg-emerald-50/50 flex flex-col items-center justify-center text-slate-400 hover:text-emerald-700 transition-all opacity-40 hover:opacity-100 group/cell no-print cursor-pointer"
                               >
-                                <Plus className="w-3.5 h-3.5 group-hover/cell:scale-110 transition-transform" />
-                                <span className="text-[10px] mt-0.5">{t('noShift')}</span>
+                                <Plus className="w-4 h-4 group-hover/cell:scale-110 transition-transform" />
+                                <span className="text-sm mt-0.5">{t('noShift')}</span>
                               </button>
                             )}
                           </td>
                         );
                       })}
-
-                      {/* Weekly Total Hours Summary */}
-                      <td className="py-2 px-3 text-right border-l border-slate-200 align-middle">
-                        <div className="flex flex-col items-end">
-                          <span
-                            className={`font-mono font-black text-sm px-2 py-0.5 rounded-lg ${
-                              isOvertime
-                                ? 'bg-amber-100 text-amber-900 border border-amber-300'
-                                : isMissing
-                                ? 'bg-rose-50 text-rose-700 border border-rose-200'
-                                : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                            }`}
-                          >
-                            {summary.totalHours.toFixed(1)} hrs
-                          </span>
-
-                          {isOvertime && (
-                            <span className="text-[10px] font-bold text-amber-700 flex items-center space-x-0.5 mt-0.5">
-                              <AlertTriangle className="w-2.5 h-2.5" />
-                              <span>+{summary.overtimeHours.toFixed(1)}h OT</span>
-                            </span>
-                          )}
-
-                          {isMissing && (
-                            <span className="text-[10px] font-bold text-rose-600 mt-0.5">
-                              {language === 'ko' ? '미배정' : 'Missing'}
-                            </span>
-                          )}
-                        </div>
-                      </td>
                     </tr>
                   );
                 })
@@ -1359,7 +1672,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                   {editingShift ? t('editShift') : t('addShift')}
                 </h2>
                 <p className="text-xs text-slate-500">
-                  {modalEmployee.fullName} • {modalDay.dayOfWeek} ({modalDay.date})
+                  {modalEmployee.nickname?.trim() ? `${modalEmployee.nickname} (${modalEmployee.fullName})` : modalEmployee.fullName} • {modalDay.dayOfWeek} ({modalDay.date})
                 </p>
               </div>
               <button
@@ -1376,7 +1689,9 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                 <label className="font-bold text-slate-700 block mb-1.5 flex items-center justify-between">
                   <span>{language === 'ko' ? '근무 프리셋 빠른 선택 (SHIFT PRESET)' : 'Shift Presets'}</span>
                   <span className="text-[10px] text-slate-500 font-normal">
-                    {isModalEmpCashier ? 'Cashier: 6h+ 20분 / 11h+ 40분' : 'General: 6h+ 30분 / 11h+ 60분'}
+                    {isModalEmpCashier
+                      ? (language === 'ko' ? 'Cashier: 6h+ 20분 / 11h+ 40분' : 'Cashier: 6h+ 20m / 11h+ 40m')
+                      : (language === 'ko' ? 'General: 6h+ 30분 / 11h+ 60분' : 'General: 6h+ 30m / 11h+ 60m')}
                   </span>
                 </label>
                 <div className="grid grid-cols-2 gap-2">
@@ -1394,7 +1709,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                       <span className="font-mono text-emerald-700 text-[11px]">13:00 - 22:00</span>
                     </p>
                     <p className="text-[10px] text-slate-500 mt-0.5">
-                      9.0 hrs • {isModalEmpCashier ? '휴게 20분' : '휴게 30분'}
+                      9.0 hrs • {isModalEmpCashier ? (language === 'ko' ? '휴게 20분' : '20m break') : (language === 'ko' ? '휴게 30분' : '30m break')}
                     </p>
                   </button>
 
@@ -1412,7 +1727,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                       <span className="font-mono text-emerald-700 text-[11px]">05:00 - 13:00</span>
                     </p>
                     <p className="text-[10px] text-slate-500 mt-0.5">
-                      8.0 hrs • {isModalEmpCashier ? '휴게 20분' : '휴게 30분'}
+                      8.0 hrs • {isModalEmpCashier ? (language === 'ko' ? '휴게 20분' : '20m break') : (language === 'ko' ? '휴게 30분' : '30m break')}
                     </p>
                   </button>
 
@@ -1430,7 +1745,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                       <span className="font-mono text-emerald-700 text-[11px]">16:00 - 22:00</span>
                     </p>
                     <p className="text-[10px] text-slate-500 mt-0.5">
-                      6.0 hrs • {isModalEmpCashier ? '휴게 20분' : '휴게 30분'}
+                      6.0 hrs • {isModalEmpCashier ? (language === 'ko' ? '휴게 20분' : '20m break') : (language === 'ko' ? '휴게 30분' : '30m break')}
                     </p>
                   </button>
 
@@ -1448,7 +1763,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                       <span className="font-mono text-emerald-700 text-[11px]">13:00 - 21:00</span>
                     </p>
                     <p className="text-[10px] text-slate-500 mt-0.5">
-                      8.0 hrs • {isModalEmpCashier ? '휴게 20분' : '휴게 30분'}
+                      8.0 hrs • {isModalEmpCashier ? (language === 'ko' ? '휴게 20분' : '20m break') : (language === 'ko' ? '휴게 30분' : '30m break')}
                     </p>
                   </button>
                 </div>
@@ -1489,6 +1804,23 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                 </div>
               </div>
 
+              {/* Position Field (Item 2: 별도의 한줄을 더 만들어서 position을 직접 넣을수 있도록 해줘) */}
+              <div>
+                <label className="font-bold text-slate-700 block mb-1 flex items-center justify-between">
+                  <span>{language === 'ko' ? '직책 / 담당 업무 (Position) *' : 'Shift Position / Role *'}</span>
+                  <span className="text-[10px] text-slate-400 font-normal">
+                    {language === 'ko' ? '스케쥴 셀에 표시될 직책' : 'Displayed in schedule cell'}
+                  </span>
+                </label>
+                <input
+                  type="text"
+                  value={shiftPosition}
+                  onChange={(e) => setShiftPosition(e.target.value)}
+                  placeholder={modalEmployee?.position || (language === 'ko' ? '예: Cashier, Meat Cutter, Kitchen' : 'e.g. Cashier, Meat Cutter, Kitchen')}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 font-semibold text-slate-900 focus:bg-white focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 text-xs"
+                />
+              </div>
+
               {/* Paid Break Policy Banner */}
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-200">
                 <div className="flex items-center justify-between">
@@ -1506,13 +1838,13 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                     </span>
                     <span className="text-[11px] font-semibold text-slate-700">
                       {isModalEmpCashier
-                        ? (language === 'ko' ? '6시간 이상 20분 / 11시간 이상 40분 유급' : '>=6h 20m / >=11h 40m Paid')
-                        : (language === 'ko' ? '6시간 이상 30분 / 11시간 이상 1시간 유급' : '>=6h 30m / >=11h 60m Paid')}
+                        ? (language === 'ko' ? '6시간 이상 20분 / 11시간 이상 40분' : '>=6h 20m / >=11h 40m')
+                        : (language === 'ko' ? '6시간 이상 30분 / 11시간 이상 1시간' : '>=6h 30m / >=11h 60m')}
                     </span>
                   </div>
                   <div className="text-right">
                     <span className="inline-block px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 font-extrabold text-[11px]">
-                      {language === 'ko' ? '자동 유급 휴게' : 'Granted Paid Break'}: {liveShiftCalc.paidBreakMinutes}m
+                      {language === 'ko' ? '인정 휴게' : 'Break Allowance'}: {liveShiftCalc.paidBreakMinutes}m
                     </span>
                   </div>
                 </div>
@@ -1575,8 +1907,8 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                     </span>
                     <span className="text-amber-800">
                       {language === 'ko'
-                        ? `유급 한도(${liveShiftCalc.paidBreakMinutes}분)를 ${liveShiftCalc.excessBreakMinutes}분 초과하여 무급 처리됩니다.`
-                        : `Exceeds the ${liveShiftCalc.paidBreakMinutes}m paid allowance. Deduction applied to daily hours.`}
+                        ? `휴게 한도(${liveShiftCalc.paidBreakMinutes}분)를 ${liveShiftCalc.excessBreakMinutes}분 초과하여 차감 처리됩니다.`
+                        : `Exceeds the ${liveShiftCalc.paidBreakMinutes}m break allowance. Deduction applied to daily hours.`}
                     </span>
                   </div>
                 </div>
@@ -1585,8 +1917,8 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                   <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                   <span>
                     {language === 'ko'
-                      ? `전 시간 유급 인정 (실제 휴게가 유급 한도 ${liveShiftCalc.paidBreakMinutes}분 이내이므로 차감 없음)`
-                      : `Full pay granted: Break is within the ${liveShiftCalc.paidBreakMinutes}m paid allowance.`}
+                      ? `전 시간 근무 인정 (실제 휴게가 기준 한도 ${liveShiftCalc.paidBreakMinutes}분 이내이므로 차감 없음)`
+                      : `Full pay granted: Break is within the ${liveShiftCalc.paidBreakMinutes}m break allowance.`}
                   </span>
                 </div>
               )}
@@ -1605,8 +1937,8 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                     <span className="font-mono font-bold text-xs">{liveShiftCalc.rawHours.toFixed(2)} hrs</span>
                   </div>
                   <div>
-                    <span className="opacity-75 block">{language === 'ko' ? '유급 휴게' : 'Paid Break'}:</span>
-                    <span className="font-mono font-bold text-xs text-emerald-600">+{liveShiftCalc.paidBreakMinutes}m (유급)</span>
+                    <span className="opacity-75 block">{language === 'ko' ? '인정 휴게' : 'Break'}:</span>
+                    <span className="font-mono font-bold text-xs text-emerald-600">+{liveShiftCalc.paidBreakMinutes}m</span>
                   </div>
                   <div>
                     <span className="opacity-75 block">{language === 'ko' ? '초과 차감' : 'Unpaid Excess'}:</span>
@@ -1893,7 +2225,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
                     >
-                      {language === 'ko' ? '전체 사업장 (1~5번)' : 'All 5 Branches'}
+                      {language === 'ko' ? '전체 사업장 (All Branches)' : 'All Branches'}
                     </button>
                     {BUSINESS_GROUPS.map((grp) => (
                       <button
@@ -2024,27 +2356,27 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                           </span>
                         </div>
 
-                        <table className="w-full border-collapse text-[11px]">
+                        <table className="w-full border-collapse text-sm">
                           <thead>
                             <tr className="bg-slate-100 text-slate-800 font-bold border-b border-slate-200">
-                              <th className="py-1.5 px-2 text-center w-8 border-r border-slate-200">No</th>
-                              <th className="py-1.5 px-2.5 text-left w-36 border-r border-slate-200">
+                              <th className="py-2 px-2 text-center w-9 border-r border-slate-200">No</th>
+                              <th className="py-2 px-2.5 text-left w-44 border-r border-slate-200">
                                 {language === 'ko' ? '직원명 / 부서' : 'Employee / Dept'}
                               </th>
                               {days.map((day, idx) => (
                                 <th
                                   key={day.date}
-                                  className={`py-1.5 px-1 text-center border-r border-slate-200 ${
+                                  className={`py-2 px-1 text-center border-r border-slate-200 ${
                                     idx === 1 || idx === 2 ? 'bg-amber-100/60 text-amber-900' : ''
                                   }`}
                                 >
                                   <div>{language === 'ko' ? day.dayOfWeekKo : day.dayOfWeek}</div>
-                                  <div className="text-[9px] font-normal opacity-75">
+                                  <div className="text-xs font-normal opacity-75">
                                     {language === 'ko' ? day.displayDateKo : day.displayDate}
                                   </div>
                                 </th>
                               ))}
-                              <th className="py-1.5 px-2 text-right w-20">
+                              <th className="py-2 px-2 text-right w-24">
                                 {language === 'ko' ? '주간 합계' : 'Total'}
                               </th>
                             </tr>
@@ -2052,7 +2384,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                           <tbody className="divide-y divide-slate-200">
                             {grpEmps.length === 0 ? (
                               <tr>
-                                <td colSpan={10} className="py-4 text-center text-slate-400 italic">
+                                <td colSpan={10} className="py-4 text-center text-slate-400 italic text-sm">
                                   {language === 'ko' ? '등록된 직원이 없습니다.' : 'No employees in this group.'}
                                 </td>
                               </tr>
@@ -2061,15 +2393,16 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                                 const empShifts = effectiveShifts.filter((s) => s.employeeId === emp.employeeId);
                                 const summary = calculateWeeklyHoursSummary(empShifts);
                                 const isOt = summary.totalHours > 40;
+                                const displayName = emp.nickname?.trim() || emp.fullName;
 
                                 return (
                                   <tr key={emp.employeeId} className={index % 2 === 1 ? 'bg-slate-50/50' : 'bg-white'}>
-                                    <td className="py-1 px-1 text-center text-slate-500 text-[10px] border-r border-slate-200">
+                                    <td className="py-1.5 px-1 text-center text-slate-500 text-xs border-r border-slate-200">
                                       {index + 1}
                                     </td>
-                                    <td className="py-1 px-2.5 text-left border-r border-slate-200">
-                                      <div className="font-bold text-slate-900">{emp.fullName}</div>
-                                      <div className="text-[10px] text-slate-500">
+                                    <td className="py-1.5 px-2.5 text-left border-r border-slate-200">
+                                      <div className="font-bold text-slate-900 text-base">{displayName}</div>
+                                      <div className="text-xs text-slate-500">
                                         {emp.department} • {emp.position}
                                       </div>
                                     </td>
@@ -2079,7 +2412,7 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                                         return (
                                           <td
                                             key={day.date}
-                                            className="py-1 px-1 text-center text-slate-400 text-[10px] bg-slate-50/30 border-r border-slate-200"
+                                            className="py-1.5 px-1 text-center text-slate-400 text-sm font-semibold bg-slate-50/30 border-r border-slate-200"
                                           >
                                             OFF
                                           </td>
@@ -2088,30 +2421,38 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                                       return (
                                         <td
                                           key={day.date}
-                                          className="py-1 px-1 text-center border-r border-slate-200 leading-tight"
+                                          className="py-1.5 px-1 text-center border-r border-slate-200 leading-snug"
                                         >
-                                          <div className="font-bold text-slate-900 text-[10px]">
-                                            {s.startTime}-{s.endTime}
+                                          <div className="font-bold text-slate-900 text-[15px]">
+                                            {s.startTime}
                                           </div>
-                                          <div className="text-[9px] text-emerald-700 font-bold">
-                                            {s.hours.toFixed(1)}h{s.isOvernight ? ' 🌙' : ''}
+                                          <div className="font-bold text-slate-900 text-[15px]">
+                                            {s.endTime}
                                           </div>
+                                          <div className="text-xs text-emerald-700 font-bold">
+                                            {s.hours.toFixed(1)}h ({language === 'ko' ? `휴게 ${s.paidBreakMinutes || 0}m` : `Break ${s.paidBreakMinutes || 0}m`}){s.isOvernight ? ' 🌙' : ''}
+                                          </div>
+                                          {s.position && (
+                                            <div className="text-xs text-indigo-700 font-bold truncate">
+                                              {s.position}
+                                            </div>
+                                          )}
                                           {printDetailMode === 'detailed' && s.actualBreakMinutes ? (
-                                            <div className="text-[8px] text-slate-400">
-                                              휴게 {s.actualBreakMinutes}분
+                                            <div className="text-[11px] text-slate-400">
+                                              {language === 'ko' ? `휴게 ${s.actualBreakMinutes}분` : `Break ${s.actualBreakMinutes}m`}
                                             </div>
                                           ) : null}
                                         </td>
                                       );
                                     })}
                                     <td
-                                      className={`py-1 px-2 text-right font-bold ${
+                                      className={`py-1.5 px-2 text-right font-bold text-sm ${
                                         isOt ? 'text-rose-700 bg-rose-50/50' : 'text-emerald-800'
                                       }`}
                                     >
                                       <div>{summary.totalHours.toFixed(1)}h</div>
                                       {isOt && (
-                                        <div className="text-[9px] text-rose-600 font-normal">
+                                        <div className="text-xs text-rose-600 font-normal">
                                           +{summary.overtimeHours.toFixed(1)}h
                                         </div>
                                       )}
@@ -2206,6 +2547,278 @@ export const ScheduleView: React.FC<ScheduleViewProps> = ({
                   <span>{language === 'ko' ? '직접 호출' : 'Call Dialog'}</span>
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Schedule Auto-Backup, Save to Computer & Restore Modal */}
+      {isBackupModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs no-print">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] flex flex-col overflow-hidden border border-slate-200 animate-in fade-in zoom-in-95 duration-150">
+            <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50">
+              <div className="flex items-center space-x-2.5">
+                <div className="w-9 h-9 rounded-xl bg-indigo-100 text-indigo-700 flex items-center justify-center">
+                  <History className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-base font-bold text-slate-900">
+                    {language === 'ko' ? '주간 스케줄 자동 백업 및 컴퓨터 저장 · 불러오기' : 'Schedule Auto-Backup, Computer Save & Restore'}
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    {language === 'ko'
+                      ? `대상 주간: ${currentWeekFriday} (${formatWorkWeekRange(currentWeekFriday, language)})`
+                      : `Target Workweek: ${currentWeekFriday} (${formatWorkWeekRange(currentWeekFriday, language)})`}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsBackupModalOpen(false)}
+                className="p-2 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-5 overflow-y-auto text-xs">
+              {backupFeedback && (
+                <div
+                  className={`p-3 rounded-xl font-bold flex items-center justify-between border ${
+                    backupFeedback.type === 'success'
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                      : 'bg-rose-50 border-rose-200 text-rose-700'
+                  }`}
+                >
+                  <div className="flex items-center space-x-2">
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                    <span>{backupFeedback.text}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setBackupFeedback(null)}
+                    className="underline text-[11px] ml-2 cursor-pointer"
+                  >
+                    {language === 'ko' ? '닫기' : 'Dismiss'}
+                  </button>
+                </div>
+              )}
+
+              {/* 1. Manual Save & File Load */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-2.5 flex flex-col justify-between">
+                  <div>
+                    <h3 className="font-bold text-slate-900 flex items-center space-x-1.5">
+                      <HardDriveDownload className="w-4 h-4 text-emerald-600" />
+                      <span>{language === 'ko' ? '수동 백업 파일 저장' : 'Manual Save to Computer'}</span>
+                    </h3>
+                    <p className="text-[11px] text-slate-500 mt-1">
+                      {language === 'ko'
+                        ? `현재 주간(${currentWeekFriday})의 근무 ${effectiveShifts.length}건을 내 컴퓨터에 .json 파일로 보관합니다.`
+                        : `Download ${effectiveShifts.length} shifts of week ${currentWeekFriday} as a .json backup file.`}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleQuickSaveScheduleBackup}
+                    className="w-full py-2 px-3 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold flex items-center justify-center space-x-1.5 cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>{language === 'ko' ? '내 컴퓨터에 저장 (.json)' : 'Save to Computer (.json)'}</span>
+                  </button>
+                </div>
+
+                <div className="p-4 rounded-xl bg-indigo-50/60 border border-indigo-200 space-y-2.5 flex flex-col justify-between">
+                  <div>
+                    <h3 className="font-bold text-slate-900 flex items-center space-x-1.5">
+                      <FolderOpen className="w-4 h-4 text-indigo-600" />
+                      <span>{language === 'ko' ? '컴퓨터에서 백업 불러오기' : 'Load Backup File (.json)'}</span>
+                    </h3>
+                    <p className="text-[11px] text-slate-600 mt-1">
+                      {language === 'ko'
+                        ? '저장해 둔 .json 백업 파일을 불러와 현재 주간 스케줄에 즉시 적용합니다.'
+                        : 'Select a saved .json schedule backup file from your computer to apply.'}
+                    </p>
+                  </div>
+                  <label className="w-full py-2 px-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold flex items-center justify-center space-x-1.5 cursor-pointer">
+                    <Upload className="w-3.5 h-3.5" />
+                    <span>{language === 'ko' ? '백업 파일 선택 (.json)' : 'Choose Backup File (.json)'}</span>
+                    <input
+                      type="file"
+                      accept=".json,application/json"
+                      onChange={handleUploadBackupFile}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+              </div>
+
+              {/* Apply Mode Option */}
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 space-y-2">
+                <span className="font-bold text-slate-800 block">
+                  {language === 'ko' ? '백업 적용 방식 선택' : 'Restore Application Mode'}
+                </span>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setRestoreMode('overwrite')}
+                    className={`p-2.5 rounded-xl border text-left cursor-pointer ${
+                      restoreMode === 'overwrite'
+                        ? 'bg-emerald-600 text-white border-emerald-600 font-bold'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                    }`}
+                  >
+                    <div>{language === 'ko' ? '기존 스케줄 덮어쓰기 (Overwrite)' : 'Overwrite Current Week'}</div>
+                    <div className={`text-[10px] ${restoreMode === 'overwrite' ? 'text-emerald-100' : 'text-slate-500'}`}>
+                      {language === 'ko' ? '현재 주간을 백업 내용으로 전체 교체' : 'Replace current week shifts completely'}
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRestoreMode('merge')}
+                    className={`p-2.5 rounded-xl border text-left cursor-pointer ${
+                      restoreMode === 'merge'
+                        ? 'bg-emerald-600 text-white border-emerald-600 font-bold'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                    }`}
+                  >
+                    <div>{language === 'ko' ? '빈 날짜만 채우기 (Merge)' : 'Merge Into Empty Slots'}</div>
+                    <div className={`text-[10px] ${restoreMode === 'merge' ? 'text-emerald-100' : 'text-slate-500'}`}>
+                      {language === 'ko' ? '기존 근무를 유지하고 비어있는 요일만 복원' : 'Keep existing shifts, fill empty days'}
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Preview Uploaded File */}
+              {uploadedBackup && (
+                <div className="p-4 rounded-xl bg-amber-50 border border-amber-300 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="px-2 py-0.5 rounded bg-amber-200 text-amber-900 font-bold text-[10px]">
+                        {language === 'ko' ? '불러온 파일 미리보기' : 'Loaded Backup Preview'}
+                      </span>
+                      <p className="font-bold text-slate-900 mt-1">
+                        {language === 'ko'
+                          ? `기준 주간: ${uploadedBackup.weekStartDate} • 근무 ${uploadedBackup.shiftCount}건`
+                          : `Source Week: ${uploadedBackup.weekStartDate} • ${uploadedBackup.shiftCount} shifts`}
+                      </p>
+                      <p className="text-[11px] text-slate-600 font-mono">
+                        Exported: {new Date(uploadedBackup.exportedAt).toLocaleString()}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={isRestoringBackup}
+                      onClick={() => handleApplyBackup(uploadedBackup)}
+                      className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold shadow-xs cursor-pointer"
+                    >
+                      {isRestoringBackup
+                        ? language === 'ko'
+                          ? '적용 중...'
+                          : 'Applying...'
+                        : language === 'ko'
+                        ? '현재 주간에 적용하기'
+                        : 'Apply to Current Week'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* 2. Automatic Backup History List */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h3 className="font-bold text-slate-900">
+                    {language === 'ko'
+                      ? `자동 저장된 백업 이력 (${autoBackups.length}건)`
+                      : `Automatic Backup Snapshots (${autoBackups.length})`}
+                  </h3>
+                  <span className="text-[10px] text-slate-400">
+                    {language === 'ko' ? '스케줄 수정·삭제·복사 시 자동 생성됨' : 'Auto-saved on every shift change'}
+                  </span>
+                </div>
+
+                {autoBackups.length === 0 ? (
+                  <div className="p-6 text-center rounded-xl border border-dashed border-slate-200 text-slate-400">
+                    {language === 'ko'
+                      ? '아직 자동 저장된 백업이 없습니다. 스케줄을 입력하거나 [컴퓨터 백업 저장]을 눌러주세요.'
+                      : 'No automatic backups captured yet.'}
+                  </div>
+                ) : (
+                  <div className="divide-y divide-slate-100 border border-slate-200 rounded-xl overflow-hidden max-h-60 overflow-y-auto">
+                    {autoBackups.map((bak) => (
+                      <div key={bak.id} className="p-3 bg-white hover:bg-slate-50 flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <div className="flex items-center space-x-2">
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                bak.reason === 'manual'
+                                  ? 'bg-indigo-100 text-indigo-800'
+                                  : 'bg-emerald-100 text-emerald-800'
+                              }`}
+                            >
+                              {bak.reason === 'manual'
+                                ? language === 'ko'
+                                  ? '수동'
+                                  : 'Manual'
+                                : language === 'ko'
+                                ? '자동백업'
+                                : 'Auto'}
+                            </span>
+                            <span className="font-mono font-bold text-slate-900">{bak.weekStartDate}</span>
+                            <span className="text-slate-500">• {bak.shiftCount}{language === 'ko' ? '건' : ' shifts'}</span>
+                          </div>
+                          <p className="text-[10px] font-mono text-slate-400 mt-0.5">
+                            {new Date(bak.exportedAt).toLocaleString()}
+                          </p>
+                        </div>
+
+                        <div className="flex items-center space-x-1.5">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              downloadJsonFile(
+                                `Culmore_Schedule_Backup_${bak.weekStartDate}_${formatTimestampForFilename(bak.exportedAt)}.json`,
+                                bak
+                              )
+                            }
+                            className="px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 font-bold text-[11px] flex items-center space-x-1 cursor-pointer"
+                          >
+                            <Download className="w-3 h-3" />
+                            <span>{language === 'ko' ? '저장' : 'Save'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isRestoringBackup}
+                            onClick={() => handleApplyBackup(bak)}
+                            className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] cursor-pointer"
+                          >
+                            {language === 'ko' ? '불러와 적용' : 'Restore'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setAutoBackups(deleteScheduleAutoBackup(bak.id))}
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 cursor-pointer"
+                            title={language === 'ko' ? '백업 삭제' : 'Delete backup'}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="px-6 py-3.5 bg-slate-50 border-t border-slate-200 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setIsBackupModalOpen(false)}
+                className="px-4 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 font-bold text-xs cursor-pointer"
+              >
+                {language === 'ko' ? '닫기' : 'Close'}
+              </button>
             </div>
           </div>
         </div>

@@ -19,6 +19,7 @@ export const INITIAL_STORE_SETTINGS: StoreSettings = {
   overtimeMultiplier: 1.5,
   defaultBreakMinutes: 30,
   workWeekStartDay: 'Friday',
+  workspacePasscode: '123456',
   updatedAt: new Date().toISOString(),
   updatedBy: 'system',
 };

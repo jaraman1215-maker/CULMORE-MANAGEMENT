@@ -71,8 +71,10 @@ export const PrintPayrollRegisterStandaloneView: React.FC<PrintPayrollRegisterSt
     };
   }, [weekFriday, isDemoMode, payrollRecords, payrollPeriod, period]);
 
-  // Filter records by selectedGroup and ensure only working employees with hours/pay are displayed
+  // Filter records by selectedGroup and ensure only registered active working employees are displayed
   const displayedRecords = records.filter((r) => {
+    const emp = employees.find((e) => e.employeeId === r.employeeId);
+    if (!emp || !emp.active) return false;
     const hasWork =
       r.regularHours > 0 ||
       r.overtimeHours > 0 ||
@@ -80,8 +82,7 @@ export const PrintPayrollRegisterStandaloneView: React.FC<PrintPayrollRegisterSt
       (r.adjustments && r.adjustments.length > 0);
     if (!hasWork) return false;
     if (selectedGroup === 'ALL') return true;
-    const emp = employees.find((e) => e.employeeId === r.employeeId);
-    const grp = getBusinessGroup(r.businessGroup || r.groupNumber || emp?.businessGroup || emp?.groupNumber);
+    const grp = getBusinessGroup(r.businessGroup || r.groupNumber || emp.businessGroup || emp.groupNumber);
     return grp.id === selectedGroup;
   });
 
@@ -185,7 +186,7 @@ export const PrintPayrollRegisterStandaloneView: React.FC<PrintPayrollRegisterSt
             </div>
             <div className="text-right">
               <h2 className="text-sm font-black uppercase text-slate-900">
-                OFFICIAL WEEKLY PAYROLL REGISTER (주간 급여 대장)
+                {language === 'ko' ? 'OFFICIAL WEEKLY PAYROLL REGISTER (주간 급여 대장)' : 'OFFICIAL WEEKLY PAYROLL REGISTER'}
               </h2>
               <p className="text-xs text-slate-700 font-mono font-bold mt-0.5">
                 Pay Date: {weekFriday} (Friday)
@@ -250,7 +251,7 @@ export const PrintPayrollRegisterStandaloneView: React.FC<PrintPayrollRegisterSt
                       <span>{r.employeeName}</span>
                       {isCashier && (
                         <span className="ml-1 text-[9px] font-bold text-amber-800 bg-amber-100 px-1 py-0.2 rounded">
-                          캐셔
+                          {language === 'ko' ? '캐셔' : 'Cashier'}
                         </span>
                       )}
                     </td>
